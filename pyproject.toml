@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astock-momentum-selector"
+version = "0.1.0"
+description = "A 股强势股三日动量选股、回测和日报系统"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "pyarrow>=14.0",
+  "pyyaml>=6.0",
+  "requests>=2.31",
+  "mootdx>=0.10",
+  "stockstats>=0.6",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["astock_quant*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

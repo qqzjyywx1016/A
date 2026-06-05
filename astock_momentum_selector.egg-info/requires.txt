@@ -1,0 +1,11 @@
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14.0
+pyyaml>=6.0
+requests>=2.31
+mootdx>=0.10
+stockstats>=0.6
+tqdm>=4.66
+
+[dev]
+pytest>=8.0

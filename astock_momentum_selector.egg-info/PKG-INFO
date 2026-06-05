@@ -1,0 +1,83 @@
+Metadata-Version: 2.4
+Name: astock-momentum-selector
+Version: 0.1.0
+Summary: A 股强势股三日动量选股、回测和日报系统
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Requires-Dist: pandas>=2.0
+Requires-Dist: pyarrow>=14.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: requests>=2.31
+Requires-Dist: mootdx>=0.10
+Requires-Dist: stockstats>=0.6
+Requires-Dist: tqdm>=4.66
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+
+# AStock
+
+AStock 是一个每日收盘后运行的 A 股强势股三日动量选股系统。第一版聚焦选股、规则打分、回测和 Markdown 日报，不包含自动实盘交易。
+
+## 项目目标
+
+- 从全市场过滤出可交易股票池，剔除 ST、停牌、北交所、流动性不足和市值不匹配标的。
+- 计算动量、量能、板块、资金、形态、情绪六类规则因子。
+- 使用非机器学习的权重打分模型输出核心池和观察池。
+- 回测 T 日收盘信号在 T+1 执行的短线策略，并考虑涨跌停、停牌、T+1、手续费、印花税和滑点。
+- 生成每日选股 Markdown 报告。
+
+## 安装方式
+
+```bash
+cd astock_momentum_selector
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+## 数据源说明
+
+外部数据源按要求放置在：
+
+```text
+external/a-stock-data
+```
+
+目标仓库为 `https://github.com/simonlin1212/a-stock-data`。策略代码不直接依赖外部项目实现细节，而是通过 `MarketDataAdapter` 和 `AStockDataAdapter` 访问数据。当前适配层会优先读取本项目 `data/processed` 下的标准 parquet/csv 文件；外部仓库接口未确认时，保留清晰的 `NotImplementedError` 或中性 fallback。
+
+## 如何更新数据
+
+```bash
+python scripts/update_data.py
+```
+
+当前版本会检查外部数据源路径和本地标准化数据目录。接入真实外部接口后，可在 `AStockDataAdapter.update_data()` 中补充同步逻辑。
+
+## 如何运行选股
+
+```bash
+python scripts/run_selection.py --date 2026-06-04
+```
+
+输出保存到 `data/results/YYYY-MM-DD_selection.csv`。
+
+## 如何运行回测
+
+```bash
+python scripts/run_backtest.py --start 2023-01-01 --end 2026-06-04
+```
+
+交易记录和每日净值会保存到 `data/results`。
+
+## 如何生成日报
+
+```bash
+python scripts/generate_report.py --date 2026-06-04
+```
+
+输出文件为 `reports/YYYY-MM-DD_daily_report.md`。
+
+## 配置
+
+默认配置位于 `config/default.yaml`。路径、股票池阈值、打分权重、选股数量、回测参数和仓位参数均从配置读取，策略逻辑中不写死路径。

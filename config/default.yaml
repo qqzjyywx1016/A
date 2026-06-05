@@ -1,0 +1,138 @@
+data:
+  raw_path: data/raw
+  processed_path: data/processed
+  result_path: data/results
+  report_path: reports
+
+external:
+  astock_data_path: external/a-stock-data
+  live_enabled: false
+  cache_enabled: true
+  request_timeout: 15
+  em_min_interval: 1.0
+  max_fetch_codes:
+  astock_codes: []
+  update_start_date:
+  update_end_date:
+  stock_list_fs: "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+  stock_list_page_size: 100
+  sector_page_size: 100
+  fund_flow_limit: 120
+  show_progress: false
+
+universe:
+  exclude_st: true
+  exclude_suspended: true
+  exclude_bj: true
+  earnings_blackout_days: 0
+  lockup_blackout_days: 0
+  min_listing_days: 60
+  min_turnover_amount: 200000000
+  min_avg_turnover_amount_20d: 80000000
+  min_avg_turnover_rate_20d: 0.01
+  min_float_market_cap: 3000000000
+  max_float_market_cap:
+
+score_weights:
+  # Provisional, pending IC validation.
+  momentum: 0.25
+  volume: 0.20
+  sector: 0.15
+  market_cap: 0.15
+  reversal: 0.15
+  fund_flow: 0.0
+  pattern: 0.0
+  sentiment: 0.0
+
+selection:
+  min_total_score: 70
+  max_candidates: 20
+  max_core_pool: 5
+  max_per_sector: 2
+  # Provisional, pending IC validation.
+  max_sector_exposure: 0.40
+
+# Provisional, pending IC validation.
+rps:
+  enabled: true
+  min_cross_section: 20
+  periods: [5, 10, 20, 60]
+  composite_weights:
+    rps_5: 0.35
+    rps_10: 0.30
+    rps_20: 0.25
+    rps_60: 0.10
+  filters:
+    strong: {rps_20: 65}
+    neutral: {rps_20: 75}
+    weak: {rps_20: 85}
+    risk_off: {allow_new_position: false}
+  gate:
+    rps_60_min: 60
+    return_10d_min: -0.03
+
+# Provisional, pending IC validation.
+sector_rps:
+  enabled: true
+  min_cross_section: 5
+  periods: [3, 5, 10, 20]
+  composite_weights: {sector_rps_3: 0.35, sector_rps_5: 0.30, sector_rps_10: 0.25, sector_rps_20: 0.10}
+  filters:
+    strong: {sector_rps_5: 55, sector_rps_10: 50}
+    neutral: {sector_rps_5: 60, sector_rps_10: 55}
+    weak: {sector_rps_5: 75, sector_rps_10: 70}
+    risk_off: {allow_new_position: false}
+
+backtest:
+  initial_cash: 1000000
+  commission_rate: 0.0003
+  stamp_tax_rate: 0.0005
+  slippage_rate: 0.001
+  # Provisional, pending backtest validation.
+  max_holding_days: 10
+  stop_loss: -0.05
+  # Provisional, pending backtest validation.
+  take_profit: 0.20
+  # Provisional, pending backtest validation.
+  trail_pct: 0.08
+  # Provisional, pending backtest validation.
+  ma_exit_period: 10
+  max_positions: 5
+  max_per_sector: 2
+  # Provisional, pending IC validation.
+  max_sector_exposure: 0.40
+  # Provisional, pending IC validation.
+  single_position_pct: 0.15
+  max_participation: 0.05
+
+continue_hold:
+  enabled: true
+  exit_below: 6
+
+overheat:
+  enabled: true
+  rps5_threshold: 95
+  large_gain_pct: 7
+  volume_ratio_threshold: 2.5
+  climax_rps5_threshold: 97
+  climax_rps10_threshold: 95
+  climax_gain_pct: 8
+  stagnation_volume_ratio: 3
+  stagnation_gain_pct: 3
+  sector_stock_count_threshold: 10
+  sector_rps5_threshold: 95
+  sector_limit_up_ratio_threshold: 0.08
+
+buy_rules:
+  auction_confirm_min_pct: 0.0
+  auction_confirm_max_pct: 0.05
+  avoid_gap_up_pct: 0.07
+
+sentiment:
+  confirm_days: 1
+
+position:
+  max_single_position: 0.20
+  rating_a_position: 0.15
+  rating_b_position: 0.10
+  rating_c_position: 0.05
