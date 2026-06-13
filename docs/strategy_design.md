@@ -28,10 +28,10 @@
 第一阶段只使用 5 个打分因子，均输出 0 到 100 分：
 
 - 中期动量：`rps_20`、`rps_60`、趋势效率和 60 日新高。
-- 量价：按互斥决策树识别天量长上影、爆量长阴、放量滞涨、放量上涨、缩量回踩和缩量上涨。
-- 板块：板块 RPS、板块成交占比、板块内排名和强势股数量。
-- 市值弹性：流通市值分层、20 日均成交额分位、20 日均换手率分位和强板块小市值加成。
-- 短期反转：有序回踩、下跌减速和缩量质量。
+- 量价：连续可加打分模型，按量比与当日涨跌幅线性渐变识别放量上涨、缩量回踩、缩量上涨、放量滞涨、爆量长上影和爆量长阴，阈值两侧不再出现得分悬崖。长上影定义为 `high - max(open, close)`（从实体顶部起算，避免把大阴线误判为上影）。
+- 板块：板块 RPS、板块成交占比、板块内排名和强势股占比（占板块成员数的比例，30% 封顶满分，避免大板块靠绝对数量天然满分）。
+- 市值弹性：流通市值锚点插值、20 日均成交额分位、20 日均换手率分位和强板块小市值加成。
+- 短期反转：有序回踩、下跌减速和缩量质量（缩量分按量比 0.6 至 1.05 线性渐变，不再是 0.7 处的 0/100 跳变）。
 
 资金结构和事件正向分在第一阶段禁用：`fund_flow` 和 `sentiment` 权重为 0，由 `ScoreEngine` 自动对剩余有效因子重归一。事件数据只作为 Universe 避雷钩子，不作为正向加分。
 
@@ -79,7 +79,7 @@ sector_rps_N = rank_pct(sector_return_Nd) * 100
 
 ## 市值弹性因子
 
-市值弹性因子只在股票池已剔除 30 亿以下流通市值后工作。流通市值分层为 `[30,80)亿 -> 100`、`[80,200)亿 -> 85`、`[200,500)亿 -> 65`、`[500亿,+∞) -> 50`。最终得分为：
+市值弹性因子只在股票池已剔除 30 亿以下流通市值后工作。流通市值得分在锚点 `30亿 -> 100`、`80亿 -> 85`、`200亿 -> 65`、`500亿 -> 50` 之间分段线性插值（两端取边界值），避免 79 亿与 81 亿之间出现 15 分的台阶跳变。最终得分为：
 
 ```text
 market_cap_score =
@@ -103,7 +103,7 @@ market_cap_score =
 - 资金 0%
 - 情绪 0%
 
-活跃 5 项权重合计 0.90，`ScoreEngine` 会对非零且非中性缺失的因子重归一，保持 `total_score` 量纲稳定。
+`ScoreEngine` 会对非零且非中性缺失的因子权重重归一，保持 `total_score` 量纲稳定。当前 baostock 阶段 `market_cap` 权重为 0，实际活跃 4 项权重合计 0.75，归一后动量实际权重约 0.33。
 
 评级规则：
 
@@ -116,6 +116,16 @@ market_cap_score =
 
 默认筛选总分不低于 70、评级为 A/B、板块强度不低于中性，并剔除长上影和放量滞涨标的。观察池最多 20 只，核心池为 A 级且最多 5 只。`selection.max_per_sector=2` 控制最终候选池同一 active sector 数量；回测端同时限制同一 active sector 总仓位不超过 `max_sector_exposure=0.40`。这些阈值均为 provisional, pending IC validation。
 
+## 市场状态判定
+
+市场状态由 `SentimentFactor` 输出，直接控制总仓位阀门与 RPS 准入分档，因此判定必须抗单日噪音：
+
+- 上涨家数占比使用近 `sentiment.confirm_days`（默认 3）个交易日的均值平滑，单日恐慌或单日反弹不会立即翻转状态。
+- `risk_off` 除占比与涨跌停对比外，还要求跌停家数达到绝对恐慌阈值 `risk_off_min_limit_down`（默认 30 家）；平静市场里 3 比 2 的涨跌停对比不构成 risk_off。
+- 提供指数数据时，`strong` 额外要求基准指数（默认沪深 300）收于 MA20 上方；指数趋势向下时强势状态降级为中性，避免普涨脉冲在下行趋势里打满仓位。
+
+一股多板块时 active sector 取板块 RPS 综合分最高者，存在 max 统计量偏高的固有倾向，因此因子同时输出 `second_sector_*` 次强板块字段用于复盘对照。
+
 ## OverheatFilter 前置过热筛选
 
 `OverheatFilter` 是前置筛选器，不是因子，不参与任何加权。完整信号路径为 `UniverseFilter -> 因子计算/打分 -> OverheatFilter -> StockSelector -> TradePlan`。它只使用 T 日收盘后可得字段，在最终选股前剔除短期过热或板块高潮标的，并把被剔除股票保存到 `data/results/YYYY-MM-DD_rejected.csv`，字段包含 `reject_reason`。
@@ -124,7 +134,7 @@ market_cap_score =
 
 ## 买卖规则
 
-买入建议只生成交易计划，不自动下单。次日竞价涨幅 0% 到 5% 为竞价确认，高开大于 7% 或一字涨停回避，盘中突破昨日高点且放量为突破买入，回踩 5/10 日线且缩量不破为低吸。
+买入建议只生成交易计划，不自动下单。系统在 T 日收盘后无法观测次日竞价与盘中价格，因此 `BuyRuleEngine` 不再假装知道这些字段，而是输出可执行的价位水平：竞价确认区间 `buy_zone_low/high`（T 日收盘价的 0% 到 5%）、高开回避上限 `avoid_above`（收盘价 +7%）、突破触发位 `breakout_level`（T 日最高价）和回踩支撑位 `pullback_support_ma5/ma10`。计划类型由 T 日可得状态决定：`rps_pattern=acceleration` 给突破计划，`trend_pullback` 或反转分高给低吸计划，其余为竞价确认计划。回测端通过 `buy_rules.avoid_gap_up_pct` 在 T+1 开盘价超过昨收 +7% 时拒绝买入，使高开回避规则真实进入回测。
 
 卖出规则由配置驱动。优先级为止损、移动止损、止盈、趋势破位、板块退潮和最大持仓天数兜底。默认配置将固定 3 天持仓调整为 10 天上限、止盈提高到 20%、移动止损 8%、趋势破位使用 MA10；这些参数为 provisional, pending backtest validation。代码在缺少这些配置时保持旧行为，便于测试和兼容。
 
@@ -132,13 +142,13 @@ market_cap_score =
 
 持仓退出使用 `ContinueHoldScore` 评估普通退出，不使用 RPS_5/RPS_10 作为卖出条件。评分范围 0 到 10，由趋势、RPS_20 中期动量、板块状态、量价健康和风险状态五项组成。`RPS_20/RPS_60` 更适合描述中期趋势背景，`RPS_5/RPS_10` 只用于入场筛选和过热检查。
 
-退出优先级为 hard_stop_loss、market_risk_off、major_event_risk、trailing_stop、take_profit、ContinueHoldScore、max_holding_days。只有当 ContinueHoldScore 所需指标齐全时才评估普通退出，分数低于配置阈值才触发 `low_continue_hold_score`；指标缺失时回退到旧的规则引擎路径。相关阈值来自配置，当前为 provisional, pending IC/backtest validation。
+退出优先级为 hard_stop_loss、market_risk_off、major_event_risk、trailing_stop、take_profit、ContinueHoldScore、max_holding_days。只有当 ContinueHoldScore 所需指标全部存在且非 NaN 时才评估普通退出，分数低于配置阈值才触发 `low_continue_hold_score`；任一核心指标缺失或为 NaN（例如持仓股当日跌出打分面板）时回退到旧的规则引擎路径，绝不基于缺失数据强制卖出。布尔风险标志的 NaN 一律按 False 处理。相关阈值来自配置，当前为 provisional, pending IC/backtest validation。
 
 ## 回测假设
 
-回测以日线为主，T 日信号在 T+1 开盘价附近成交。买入价加入正向滑点，卖出价扣除滑点。买入收手续费，卖出收手续费和印花税。涨停日不可买入，跌停日不可卖出，停牌日不可交易。
+回测以日线为主，T 日信号在 T+1 开盘价附近成交。买入价加入正向滑点，卖出价扣除滑点。买入收手续费，卖出收手续费和印花税，手续费按 `min_commission`（默认 5 元）设置单笔下限。每个交易日先处理卖出再处理买入，卖出资金当日可用于新开仓，与 A 股资金 T+0 规则一致。封死涨停（全天未打开）不可买入，封死跌停不可卖出并顺延，停牌日不可交易。涨跌停与封板判定优先使用数据层落库的 `is_limit_up/is_limit_down/is_sealed_limit_up/is_sealed_limit_down` 标志；缺失时用相对昨收的比例阈值近似（比例在复权下不变），不再对 qfq 价格按"分"取整推算绝对涨停价。
 
-同一 active sector 回测持仓数量默认不超过 2 只，且同一 active sector 总市值占当前权益默认不超过 40%。单票仓位默认 15%，总仓位由市场状态阀门控制：strong 80%、neutral 50%、weak 20%、risk_off 0%。这些参数均为 provisional, pending IC/backtest validation。
+若信号行携带 `suggested_position`（由 PositionSizer 按评级生成），回测按该比例开仓，否则回退 `single_position_pct`；评级仓位由此进入回测验证闭环。同一 active sector 回测持仓数量默认不超过 2 只，且同一 active sector 总市值占当前权益默认不超过 40%。总仓位由市场状态阀门控制：strong 80%、neutral 50%、weak 20%、risk_off 0%。组合级熔断 `max_portfolio_drawdown`（默认 10%）生效时，权益距峰值回撤达到阈值后停止新开仓，直至回撤收窄。止损成交价低于理论止损价的交易会打上 `gap_exit` 标记，回测指标输出 `gap_stop_count/gap_stop_share` 用于评估跳空止损暴露；指标同时包含夏普、索提诺、年化波动率与最大回撤修复天数，无基准时超额收益输出 NaN 而非绝对收益。这些参数均为 provisional, pending IC/backtest validation。
 
 ## IC 验证工具
 

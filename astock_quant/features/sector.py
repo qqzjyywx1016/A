@@ -28,6 +28,15 @@ class SectorFactor:
         self.config = config or {}
         self.min_cross_section = int(self.config.get("min_cross_section", 5))
         self.composite_weights = dict(self.config.get("composite_weights", DEFAULT_SECTOR_RPS_WEIGHTS))
+        self.sector_guard_enabled = any(
+            key in self.config
+            for key in [
+                "backtest_sector_type",
+                "use_concept_in_backtest",
+                "require_effective_date_for_concept_backtest",
+                "use_concept_in_live",
+            ]
+        )
 
     def calculate(
         self,
@@ -55,7 +64,7 @@ class SectorFactor:
         if snapshot.empty:
             return pd.DataFrame(columns=["stock_code", "trade_date", "score"])
 
-        membership = self._build_stock_sector_membership(snapshot, sector_map)
+        membership = self._build_stock_sector_membership(snapshot, sector_map, signal_date)
         if sector_daily is None or sector_daily.empty:
             logger.warning("sector_daily missing; using neutral sector RPS and score")
             return self._neutral_result(membership)
@@ -81,14 +90,15 @@ class SectorFactor:
 
         snapshot = membership.merge(current_sector.drop(columns=["sector_name", "sector_type"]), on="sector_code", how="left")
         snapshot["stock_rank_in_sector"] = snapshot.groupby("sector_code")["stock_return_3d"].rank(pct=True).fillna(0.5)
-        strong_counts = (
+        strong_stats = (
             snapshot.assign(is_strong=snapshot["stock_return_3d"].fillna(0) > 0.03)
             .groupby("sector_code")["is_strong"]
-            .sum()
-            .rename("sector_strong_stock_count")
+            .agg(sector_strong_stock_count="sum", sector_strong_stock_ratio="mean")
         )
-        snapshot = snapshot.merge(strong_counts, on="sector_code", how="left")
-        count_score = (snapshot["sector_strong_stock_count"].fillna(0).clip(0, 10) / 10) * 100
+        snapshot = snapshot.merge(strong_stats, on="sector_code", how="left")
+        # Ratio-based breadth: an absolute count saturates large sectors and starves
+        # small ones; 30%+ of members being strong earns full credit at any size.
+        count_score = (snapshot["sector_strong_stock_ratio"].fillna(0).clip(0, 0.30) / 0.30) * 100
         sector_amount_score = _rank_score(snapshot["sector_amount_ratio"].fillna(0))
         stock_rank_score = snapshot["stock_rank_in_sector"].fillna(0.5) * 100
         snapshot["score"] = (
@@ -125,9 +135,13 @@ class SectorFactor:
             "sector_rank_pct",
             "stock_rank_in_sector",
             "sector_strong_stock_count",
+            "sector_strong_stock_ratio",
+            "second_sector_code",
+            "second_sector_name",
+            "second_sector_rps",
             "sector_regime",
         ]
-        return snapshot[columns].reset_index(drop=True)
+        return snapshot[[column for column in columns if column in snapshot.columns]].reset_index(drop=True)
 
     def _current_sector_snapshot(self, sector_daily: pd.DataFrame, signal_date: pd.Timestamp) -> pd.DataFrame:
         sector = self._normalize_sector_frame(sector_daily)
@@ -209,10 +223,16 @@ class SectorFactor:
             return 50.0
         return weighted_sum / available_weight
 
-    def _build_stock_sector_membership(self, snapshot: pd.DataFrame, sector_map: pd.DataFrame | None) -> pd.DataFrame:
+    def _build_stock_sector_membership(
+        self,
+        snapshot: pd.DataFrame,
+        sector_map: pd.DataFrame | None,
+        signal_date: pd.Timestamp,
+    ) -> pd.DataFrame:
         base = snapshot.copy()
         if sector_map is not None and not sector_map.empty and "stock_code" in sector_map.columns:
             mapping = self._normalize_sector_frame(sector_map)
+            mapping = self._filter_sector_map_for_mode(mapping, signal_date)
             membership = base.merge(
                 mapping[["stock_code", "sector_code", "sector_name", "sector_type"]].drop_duplicates(),
                 on="stock_code",
@@ -228,6 +248,27 @@ class SectorFactor:
         membership["sector_type"] = membership["sector_type"].fillna("unknown")
         membership["sector"] = membership["sector_name"]
         return membership
+
+    def _filter_sector_map_for_mode(self, mapping: pd.DataFrame, signal_date: pd.Timestamp) -> pd.DataFrame:
+        if not self.sector_guard_enabled:
+            return mapping
+        mode = str(self.config.get("mode", "backtest")).lower()
+        if mode == "live":
+            if self.config.get("use_concept_in_live", True):
+                return mapping
+            backtest_type = str(self.config.get("backtest_sector_type", "industry")).lower()
+            return mapping[mapping["sector_type"].astype(str).str.lower() == backtest_type].copy()
+
+        backtest_type = str(self.config.get("backtest_sector_type", "industry")).lower()
+        sector_type = mapping["sector_type"].astype(str).str.lower()
+        if not self.config.get("use_concept_in_backtest", False):
+            return mapping[sector_type == backtest_type].copy()
+        if self.config.get("require_effective_date_for_concept_backtest", True) and "effective_date" in mapping.columns:
+            effective = pd.to_datetime(mapping["effective_date"], errors="coerce").dt.normalize()
+            return mapping[(sector_type == backtest_type) | effective.le(signal_date)].copy()
+        if self.config.get("require_effective_date_for_concept_backtest", True):
+            return mapping[sector_type == backtest_type].copy()
+        return mapping
 
     @staticmethod
     def _normalize_sector_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -264,6 +305,7 @@ class SectorFactor:
         result["sector_rank_pct"] = 0.5
         result["stock_rank_in_sector"] = 0.5
         result["sector_strong_stock_count"] = 0
+        result["sector_strong_stock_ratio"] = 0.0
         result["sector_regime"] = "neutral"
         columns = [
             "stock_code",
@@ -292,9 +334,13 @@ class SectorFactor:
             "sector_rank_pct",
             "stock_rank_in_sector",
             "sector_strong_stock_count",
+            "sector_strong_stock_ratio",
+            "second_sector_code",
+            "second_sector_name",
+            "second_sector_rps",
             "sector_regime",
         ]
-        return result[columns].reset_index(drop=True)
+        return result[[column for column in columns if column in result.columns]].reset_index(drop=True)
 
     @staticmethod
     def _select_active_sector(snapshot: pd.DataFrame) -> pd.DataFrame:
@@ -303,11 +349,25 @@ class SectorFactor:
             result["sector_rps_composite"] = 50.0
         if "score" not in result.columns:
             result["score"] = 50.0
-        result = result.sort_values(["stock_code", "sector_rps_composite", "score"], ascending=[True, False, False])
-        result = result.groupby("stock_code", as_index=False, group_keys=False).head(1).copy()
+        ranked = result.sort_values(["stock_code", "sector_rps_composite", "score"], ascending=[True, False, False])
+        result = ranked.groupby("stock_code", as_index=False, group_keys=False).head(1).copy()
         result["active_sector_code"] = result["sector_code"]
         result["active_sector_name"] = result["sector_name"]
         result["active_sector_type"] = result["sector_type"]
         result["active_sector_rps"] = result["sector_rps_composite"]
         result["sector"] = result["sector_name"]
+        # Picking max composite across memberships overstates sector strength
+        # (max-statistic bias); expose the runner-up sector for review.
+        second = (
+            ranked.groupby("stock_code", as_index=False, group_keys=False)
+            .nth(1)[["stock_code", "sector_code", "sector_name", "sector_rps_composite"]]
+            .rename(
+                columns={
+                    "sector_code": "second_sector_code",
+                    "sector_name": "second_sector_name",
+                    "sector_rps_composite": "second_sector_rps",
+                }
+            )
+        )
+        result = result.merge(second, on="stock_code", how="left")
         return result

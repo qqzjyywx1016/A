@@ -16,6 +16,12 @@ from astock_quant.strategy.sell_rules import SellRuleEngine
 from astock_quant.utils.calendar import previous_trading_date, trading_days_between
 
 
+EPS = 1e-6
+# Relative tolerance for limit-price checks. qfq-adjusted prices lose the exact
+# cent rounding of real limit prices, so absolute comparisons are unreliable.
+LIMIT_RELATIVE_TOLERANCE = 0.003
+
+
 @dataclass(slots=True)
 class BacktestResult:
     """Backtest outputs: trade records, equity curve and summary metrics."""
@@ -40,6 +46,11 @@ class BacktestEngine:
         self.max_sector_exposure = float(config.get("max_sector_exposure", 0.40))
         self.single_position_pct = float(config.get("single_position_pct", 0.20))
         self.max_participation = float(config.get("max_participation", 0.05))
+        max_portfolio_drawdown = config.get("max_portfolio_drawdown")
+        self.max_portfolio_drawdown = None if max_portfolio_drawdown is None else float(max_portfolio_drawdown)
+        buy_rules_config = config.get("buy_rules", {})
+        avoid_gap_up_pct = buy_rules_config.get("avoid_gap_up_pct") if isinstance(buy_rules_config, dict) else None
+        self.avoid_gap_up_pct = None if avoid_gap_up_pct is None else float(avoid_gap_up_pct)
         continue_hold_config = config.get("continue_hold", {})
         self.continue_hold_enabled = isinstance(continue_hold_config, dict) and continue_hold_config.get("enabled", False)
         self.continue_hold_scorer = ContinueHoldScorer(continue_hold_config if isinstance(continue_hold_config, dict) else {})
@@ -48,6 +59,7 @@ class BacktestEngine:
             commission_rate=float(config.get("commission_rate", 0.0003)),
             stamp_tax_rate=float(config.get("stamp_tax_rate", 0.0005)),
             slippage_rate=float(config.get("slippage_rate", 0.001)),
+            min_commission=float(config.get("min_commission", 0.0)),
         )
 
     def run(
@@ -67,16 +79,7 @@ class BacktestEngine:
         bars = daily_bars.copy()
         bars["trade_date"] = pd.to_datetime(bars["trade_date"]).dt.normalize()
         bars = bars.sort_values(["trade_date", "stock_code"]).reset_index(drop=True)
-        if "ma5" not in bars.columns:
-            bars["ma5"] = bars.groupby("stock_code")["close"].transform(lambda s: s.rolling(5, min_periods=1).mean())
-        if self.continue_hold_enabled and "ma10" not in bars.columns:
-            bars["ma10"] = bars.groupby("stock_code")["close"].transform(lambda s: s.rolling(10, min_periods=1).mean())
-        if self.sell_rules.ma_exit_period is not None:
-            ma_column = f"ma{self.sell_rules.ma_exit_period}"
-            if ma_column not in bars.columns:
-                bars[ma_column] = bars.groupby("stock_code")["close"].transform(
-                    lambda s: s.rolling(self.sell_rules.ma_exit_period, min_periods=1).mean()
-                )
+        bars = self._ensure_derived_columns(bars)
         signals = signals.copy()
         if not signals.empty:
             signals["trade_date"] = pd.to_datetime(signals["trade_date"]).dt.normalize()
@@ -84,31 +87,81 @@ class BacktestEngine:
 
         trading_dates = sorted(bars["trade_date"].unique())
         cash = self.initial_cash
+        peak_equity = self.initial_cash
         positions: dict[str, dict[str, Any]] = {}
         trades: list[Trade] = []
         equity_rows: list[dict[str, Any]] = []
 
         for current_date in trading_dates:
             day_bars = bars[bars["trade_date"] == current_date].set_index("stock_code")
-            previous_date = previous_trading_date(trading_dates, current_date)
-            if previous_date is not None:
-                cash = self._process_entries(signals, previous_date, day_bars, cash, positions, trades, current_date)
             self._update_peak_closes(day_bars, positions)
+            # Exits run before entries: A-share sell proceeds are available for buying the same day.
             cash = self._process_exits(day_bars, cash, positions, trades, trading_dates, current_date)
+            previous_date = previous_trading_date(trading_dates, current_date)
+            if previous_date is not None and not self._entries_blocked(day_bars, cash, positions, peak_equity):
+                cash = self._process_entries(signals, previous_date, day_bars, cash, positions, trades, current_date)
             market_value = self._mark_to_market(day_bars, positions)
+            equity = cash + market_value
+            peak_equity = max(peak_equity, equity)
             equity_rows.append(
                 {
                     "trade_date": pd.Timestamp(current_date).date().isoformat(),
                     "cash": round(cash, 2),
                     "market_value": round(market_value, 2),
-                    "equity": round(cash + market_value, 2),
+                    "equity": round(equity, 2),
                 }
             )
 
-        trades_df = pd.DataFrame([asdict(trade) for trade in trades])
+        trades_df = pd.DataFrame([asdict(trade) for trade in trades], columns=Trade.__dataclass_fields__.keys())
+        for flag_column in ["limit_blocked", "gap_exit"]:
+            if flag_column in trades_df.columns:
+                trades_df[flag_column] = trades_df[flag_column].astype(object)
         equity_df = pd.DataFrame(equity_rows)
         metrics = MetricsCalculator().calculate(equity_df, trades_df, benchmark_curve=benchmark_curve)
         return BacktestResult(trades=trades_df, equity_curve=equity_df, metrics=metrics)
+
+    def _ensure_derived_columns(self, bars: pd.DataFrame) -> pd.DataFrame:
+        """Compute prev_close and required MAs, filling NaN instead of skipping.
+
+        Sparse panel merges leave these columns present but mostly NaN; trusting
+        column existence alone silently disables exit logic on uncovered rows.
+        """
+
+        grouped = bars.groupby("stock_code")
+        computed_prev_close = grouped["close"].shift(1)
+        if "prev_close" in bars.columns:
+            bars["prev_close"] = pd.to_numeric(bars["prev_close"], errors="coerce").fillna(computed_prev_close)
+        else:
+            bars["prev_close"] = computed_prev_close
+
+        ma_periods = {5}
+        if self.continue_hold_enabled:
+            ma_periods.add(10)
+        if self.sell_rules.ma_exit_period is not None:
+            ma_periods.add(int(self.sell_rules.ma_exit_period))
+        for period in sorted(ma_periods):
+            column = f"ma{period}"
+            computed = grouped["close"].transform(lambda s, p=period: s.rolling(p, min_periods=1).mean())
+            if column in bars.columns:
+                bars[column] = pd.to_numeric(bars[column], errors="coerce").fillna(computed)
+            else:
+                bars[column] = computed
+        return bars
+
+    def _entries_blocked(
+        self,
+        day_bars: pd.DataFrame,
+        cash: float,
+        positions: dict[str, dict[str, Any]],
+        peak_equity: float,
+    ) -> bool:
+        """Portfolio circuit breaker: stop opening positions while in a deep drawdown."""
+
+        if self.max_portfolio_drawdown is None or peak_equity <= 0:
+            return False
+        current_equity = cash + self._mark_to_market(day_bars, positions)
+        drawdown = 1 - current_equity / peak_equity
+        return drawdown >= self.max_portfolio_drawdown
 
     def _process_entries(
         self,
@@ -140,9 +193,11 @@ class BacktestEngine:
                 if same_sector_count >= self.max_per_sector:
                     continue
             bar = day_bars.loc[code]
-            if self._is_untradable_for_buy(bar):
+            if self._is_untradable_for_buy(code, bar):
                 continue
-            buy_price = self.broker.buy_price(float(bar["open"]))
+            if self._is_excessive_gap_up(bar):
+                continue
+            buy_price = self._buy_execution_price(code, bar)
             current_market_value = self._mark_to_market(day_bars, positions)
             current_equity = cash + current_market_value
             total_cap = current_equity * PositionSizer.REGIME_TOTAL_POSITION.get(market_regime, 0.40)
@@ -157,9 +212,10 @@ class BacktestEngine:
                 else float("inf")
             )
             # Strong small-cap names can have high impact costs; cap participation to avoid unrealistic fills.
+            position_pct = self._position_pct_for_signal(signal)
             target_value = min(
                 cash,
-                current_equity * self.single_position_pct,
+                current_equity * position_pct,
                 remaining_cap,
                 sector_remaining_cap,
                 participation_cap,
@@ -180,6 +236,8 @@ class BacktestEngine:
                 "cost": amount + fee,
                 "peak_close": float(bar["close"]),
                 "active_sector_code": active_sector_code if pd.notna(active_sector_code) else None,
+                "pending_exit_reason": None,
+                "unfillable_exit_days": 0,
             }
             trades.append(
                 Trade(
@@ -196,6 +254,22 @@ class BacktestEngine:
             )
         return cash
 
+    def _position_pct_for_signal(self, signal: pd.Series) -> float:
+        """Use the rating-based suggested position when present so sizing advice is actually backtested."""
+
+        suggested = self._to_float(signal.get("suggested_position"))
+        if suggested is not None and 0 < suggested <= 1:
+            return suggested
+        return self.single_position_pct
+
+    def _is_excessive_gap_up(self, bar: pd.Series) -> bool:
+        if self.avoid_gap_up_pct is None:
+            return False
+        prev_close = self._to_float(bar.get("prev_close"))
+        if prev_close is None or prev_close <= 0:
+            return False
+        return float(bar["open"]) > prev_close * (1 + self.avoid_gap_up_pct)
+
     def _process_exits(
         self,
         day_bars: pd.DataFrame,
@@ -209,17 +283,30 @@ class BacktestEngine:
             if code not in day_bars.index:
                 continue
             bar = day_bars.loc[code]
-            if self._is_untradable_for_sell(bar):
+            if self._is_suspended(bar):
                 continue
             position = positions[code]
             if pd.Timestamp(position["entry_date"]).normalize() == pd.Timestamp(current_date).normalize():
                 continue
             holding_days = trading_days_between(trading_dates, position["entry_date"], current_date)
-            decision = self._exit_decision(position, bar, holding_days)
+            decision = self._pending_exit_decision(position, bar)
+            is_deferred_execution = decision is not None
+            if decision is None:
+                decision = self._exit_decision(position, bar, holding_days)
             if decision is None:
                 continue
             reason, base_sell_price = decision
-            sell_price = self.broker.sell_price(base_sell_price)
+            if self._is_sealed_limit_down(code, bar):
+                position["pending_exit_reason"] = reason
+                position["unfillable_exit_days"] = int(position.get("unfillable_exit_days", 0)) + 1
+                continue
+            deferred_days = int(position.get("unfillable_exit_days", 0)) if is_deferred_execution else 0
+            trade_reason = f"{reason}_deferred" if is_deferred_execution else reason
+            gap_exit = False
+            if str(reason).startswith("stop_loss"):
+                stop_price = float(position["entry_price"]) * (1 + self.stop_loss)
+                gap_exit = base_sell_price < stop_price - EPS
+            sell_price = self._sell_execution_price(code, bar, base_sell_price)
             shares = int(position["shares"])
             amount = sell_price * shares
             fee = self.broker.commission(amount)
@@ -236,9 +323,12 @@ class BacktestEngine:
                     amount=round(amount, 2),
                     fee=round(fee, 2),
                     tax=round(tax, 2),
-                    reason=reason,
+                    reason=trade_reason,
                     pnl=round(pnl, 2),
                     holding_days=holding_days,
+                    limit_blocked=is_deferred_execution,
+                    deferred_days=deferred_days,
+                    gap_exit=gap_exit,
                 )
             )
             del positions[code]
@@ -256,7 +346,7 @@ class BacktestEngine:
             return "stop_loss", min(open_price, stop_price)
         if str(bar.get("market_regime", "")).lower() == "risk_off":
             return "market_risk_off", close
-        if bool(bar.get("is_major_event", False)) or bool(bar.get("is_restructuring", False)):
+        if self._truthy(bar.get("is_major_event", False)) or self._truthy(bar.get("is_restructuring", False)):
             return "major_event_risk", close
         if self.sell_rules.trail_pct is not None:
             peak_close = float(position.get("peak_close", entry_price))
@@ -276,13 +366,115 @@ class BacktestEngine:
         reason = self.sell_rules.evaluate(position, bar, holding_days=holding_days)
         return (reason, close) if reason is not None else None
 
-    @staticmethod
-    def _is_untradable_for_buy(bar: pd.Series) -> bool:
-        return bool(bar.get("is_suspended", False)) or bool(bar.get("is_limit_up", False))
+    def _pending_exit_decision(self, position: dict[str, Any], bar: pd.Series) -> tuple[str, float] | None:
+        reason = position.get("pending_exit_reason")
+        if not reason:
+            return None
+        base_price = float(bar["open"]) if str(reason) in {"stop_loss", "trailing_stop"} else float(bar["close"])
+        return str(reason), base_price
+
+    def _is_untradable_for_buy(self, code: str, bar: pd.Series) -> bool:
+        return self._is_suspended(bar) or self._is_sealed_limit_up(code, bar)
+
+    def _buy_execution_price(self, code: str, bar: pd.Series) -> float:
+        limit_up_price, _ = self._limit_prices(code, bar)
+        return min(self.broker.buy_price(float(bar["open"])), limit_up_price)
+
+    def _sell_execution_price(self, code: str, bar: pd.Series, base_price: float) -> float:
+        _, limit_down_price = self._limit_prices(code, bar)
+        sell_price = self.broker.sell_price(base_price)
+        if self._is_limit_down(code, bar):
+            return max(sell_price, limit_down_price)
+        return sell_price
+
+    def _is_sealed_limit_up(self, code: str, bar: pd.Series) -> bool:
+        explicit = bar.get("is_sealed_limit_up")
+        if explicit is not None and pd.notna(explicit):
+            return self._truthy(explicit)
+        limit_up_price, _ = self._limit_prices(code, bar)
+        return self._is_limit_up(code, bar) and float(bar.get("low", 0)) >= limit_up_price * (1 - LIMIT_RELATIVE_TOLERANCE)
+
+    def _is_sealed_limit_down(self, code: str, bar: pd.Series) -> bool:
+        explicit = bar.get("is_sealed_limit_down")
+        if explicit is not None and pd.notna(explicit):
+            return self._truthy(explicit)
+        _, limit_down_price = self._limit_prices(code, bar)
+        return self._is_limit_down(code, bar) and float(bar.get("high", 0)) <= limit_down_price * (1 + LIMIT_RELATIVE_TOLERANCE)
+
+    def _is_limit_up(self, code: str, bar: pd.Series) -> bool:
+        value = bar.get("is_limit_up", False)
+        if self._truthy(value):
+            return True
+        limit_up_price, _ = self._limit_prices(code, bar)
+        close = self._to_float(bar.get("close"))
+        if close is None or limit_up_price == float("inf"):
+            return False
+        return close >= limit_up_price * (1 - LIMIT_RELATIVE_TOLERANCE)
+
+    def _is_limit_down(self, code: str, bar: pd.Series) -> bool:
+        value = bar.get("is_limit_down", False)
+        if self._truthy(value):
+            return True
+        _, limit_down_price = self._limit_prices(code, bar)
+        close = self._to_float(bar.get("close"))
+        if close is None or limit_down_price <= 0:
+            return False
+        return close <= limit_down_price * (1 + LIMIT_RELATIVE_TOLERANCE)
 
     @staticmethod
-    def _is_untradable_for_sell(bar: pd.Series) -> bool:
-        return bool(bar.get("is_suspended", False)) or bool(bar.get("is_limit_down", False))
+    def _is_suspended(bar: pd.Series) -> bool:
+        return BacktestEngine._truthy(bar.get("is_suspended", False))
+
+    def _limit_prices(self, code: str, bar: pd.Series) -> tuple[float, float]:
+        explicit_up = self._to_float(bar.get("limit_up_price"))
+        explicit_down = self._to_float(bar.get("limit_down_price"))
+        if explicit_up is not None and explicit_down is not None:
+            return explicit_up, explicit_down
+        prev_close = self._to_float(bar.get("prev_close"))
+        if prev_close is None:
+            prev_close = self._to_float(bar.get("pre_close"))
+        if prev_close is None or prev_close <= 0:
+            return (
+                explicit_up if explicit_up is not None else float("inf"),
+                explicit_down if explicit_down is not None else 0.0,
+            )
+        limit_pct = self._limit_pct(code, bar)
+        # qfq prices do not preserve exchange cent rounding, so derived limit
+        # prices stay unrounded and comparisons use a relative tolerance.
+        return (
+            explicit_up if explicit_up is not None else prev_close * (1 + limit_pct),
+            explicit_down if explicit_down is not None else prev_close * (1 - limit_pct),
+        )
+
+    @staticmethod
+    def _limit_pct(code: str, bar: pd.Series) -> float:
+        is_st = bar.get("is_st", False)
+        if BacktestEngine._truthy(is_st):
+            return 0.05
+        prefix = str(code).split(".")[0]
+        if prefix.startswith("30") or prefix.startswith("688"):
+            return 0.20
+        if prefix.startswith("8") or prefix.startswith("4"):
+            return 0.30
+        return 0.10
+
+    @staticmethod
+    def _to_float(value: object) -> float | None:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+
+    @staticmethod
+    def _truthy(value: object) -> bool:
+        if value is None or pd.isna(value):
+            return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "是"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "否", ""}:
+                return False
+        return bool(value)
 
     @staticmethod
     def _mark_to_market(day_bars: pd.DataFrame, positions: dict[str, dict[str, Any]]) -> float:

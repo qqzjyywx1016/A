@@ -27,7 +27,7 @@ from astock_quant.features.reversal import ReversalFactor
 from astock_quant.features.sector import SectorFactor
 from astock_quant.features.volume import VolumeFactor
 from astock_quant.scoring.score_engine import ScoreEngine
-from scripts.run_selection import build_market_cap_snapshot, enrich_daily_bars_for_selection
+from scripts.run_selection import build_market_cap_snapshot, enrich_daily_bars_for_selection, sector_factor_config
 
 
 FACTOR_SCORE_COLUMNS = [
@@ -40,16 +40,22 @@ FACTOR_SCORE_COLUMNS = [
 ]
 
 
-def parse_horizons(value: str) -> list[int]:
-    return [int(item.strip()) for item in value.split(",") if item.strip()]
+def parse_horizons(values: list[int] | str) -> list[int]:
+    if isinstance(values, list):
+        return [int(item) for item in values]
+    return [int(item.strip()) for item in values.split(",") if item.strip()]
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
-    parser.add_argument("--horizons", default="1,3,5,10")
-    args = parser.parse_args()
+    parser.add_argument("--horizons", nargs="+", type=int, default=[1, 3, 5, 10])
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
 
     config = load_config()
     storage = StorageManager(config)
@@ -95,7 +101,7 @@ def main() -> None:
             latest = latest.merge(stock_basic, on="stock_code", how="left", suffixes=("", "_basic"))
         sector_slice = _slice_by_date(sector_daily, trade_date)
         index_slice = _slice_by_date(index_bars, trade_date)
-        sector_factor = SectorFactor(config.get("sector_rps", {})).calculate(
+        sector_factor = SectorFactor(sector_factor_config(config)).calculate(
             bars_slice,
             trade_date=trade_date_str,
             sector_map=sector_map,

@@ -131,7 +131,7 @@ def _volume_case_rows(code: str, current: dict) -> list[dict]:
     return rows
 
 
-def test_volume_factor_decision_tree_branches():
+def test_volume_factor_smooth_score_orders_patterns():
     trade_date = "2026-06-04"
     cases = {
         "600001.SH": {"open": 100, "high": 120, "low": 99, "close": 107, "turnover_amount": 500},
@@ -148,13 +148,40 @@ def test_volume_factor_decision_tree_branches():
 
     result = VolumeFactor().calculate(pd.DataFrame(rows), trade_date=trade_date).set_index("stock_code")
 
-    assert result.loc["600001.SH", "score"] == 10
-    assert result.loc["600002.SH", "score"] == 10
-    assert result.loc["600003.SH", "score"] == 25
-    assert result.loc["600004.SH", "score"] == 90
-    assert result.loc["600005.SH", "score"] == 80
-    assert result.loc["600006.SH", "score"] == 60
-    assert result.loc["600007.SH", "score"] == 50
+    # Risk patterns land at the bottom: blow-off long-upper-shadow surge and heavy bearish volume.
+    assert result.loc["600001.SH", "score"] <= 10
+    assert result.loc["600002.SH", "score"] <= 20
+    # High-volume stagnation scores below neutral but above outright bearish patterns.
+    assert 25 <= result.loc["600003.SH", "score"] < 50
+    # Healthy volume-price confirmation tops the table.
+    assert result.loc["600004.SH", "score"] >= 80
+    # Shrinking pullback above MA10 stays constructive; shrinking drift-up mildly positive.
+    assert 70 <= result.loc["600005.SH", "score"] <= 85
+    assert 55 <= result.loc["600006.SH", "score"] <= 65
+    # Flat close on average volume stays near neutral.
+    assert 35 <= result.loc["600007.SH", "score"] <= 55
+    assert (
+        result.loc["600004.SH", "score"]
+        > result.loc["600005.SH", "score"]
+        > result.loc["600006.SH", "score"]
+        > result.loc["600003.SH", "score"]
+        > result.loc["600002.SH", "score"]
+        >= result.loc["600001.SH", "score"]
+    )
+
+
+def test_volume_factor_score_is_smooth_at_old_branch_boundary():
+    """A 0.02x volume-ratio difference must not jump the score across a cliff."""
+
+    trade_date = "2026-06-04"
+    rows = []
+    # Old tree jumped 50 -> 90 between volume_ratio 1.19 and 1.21 with a positive close.
+    rows.extend(_volume_case_rows("600001.SH", {"open": 100, "high": 102.5, "low": 99, "close": 102, "turnover_amount": 121}))
+    rows.extend(_volume_case_rows("600002.SH", {"open": 100, "high": 102.5, "low": 99, "close": 102, "turnover_amount": 119}))
+
+    result = VolumeFactor().calculate(pd.DataFrame(rows), trade_date=trade_date).set_index("stock_code")
+
+    assert abs(result.loc["600001.SH", "score"] - result.loc["600002.SH", "score"]) < 5
 
 
 def test_score_engine_includes_reversal_and_market_cap_scores_in_total():

@@ -9,8 +9,38 @@ from astock_quant.features.momentum import _rank_score
 from astock_quant.utils.calendar import ensure_no_future_data
 
 
+def _ramp(values: pd.Series | np.ndarray, low: float, high: float) -> np.ndarray:
+    """Linear 0->1 ramp between low and high; smooth replacement for hard thresholds."""
+
+    array = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    if high <= low:
+        return (array >= low).astype(float)
+    return np.clip((array - low) / (high - low), 0.0, 1.0)
+
+
+def long_upper_shadow_flag(open_price: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """Long upper shadow measured from the candle body top, not from close.
+
+    Using ``high - close`` mislabels big bearish candles as upper shadows because
+    it includes the body; the shadow is ``high - max(open, close)``.
+    """
+
+    body_top = pd.concat([open_price, close], axis=1).max(axis=1)
+    upper_shadow = high - body_top
+    candle_range = (high - low).replace(0, np.nan)
+    return (
+        (upper_shadow / candle_range > 0.45)
+        & (upper_shadow / close.replace(0, np.nan) > 0.03)
+    ).fillna(False)
+
+
 class VolumeFactor:
-    """Score turnover strength and volume-price confirmation."""
+    """Score turnover strength and volume-price confirmation.
+
+    The score is a continuous additive model: a tiny change in volume ratio or
+    daily return moves the score gradually instead of jumping across hard branch
+    boundaries, which keeps the factor robust to threshold noise.
+    """
 
     def calculate(self, daily_bars: pd.DataFrame, *, trade_date: str) -> pd.DataFrame:
         """Return one volume score row per stock for the signal date."""
@@ -42,27 +72,10 @@ class VolumeFactor:
             & (snapshot["volume_ratio_20d"] >= 1.2)
         )
         snapshot["return_1d"] = snapshot["close"] / snapshot["prev_close_calc"].replace(0, pd.NA) - 1
-        candle_range = (snapshot["high"] - snapshot["low"]).replace(0, pd.NA)
-        snapshot["long_upper_shadow"] = (
-            ((snapshot["high"] - snapshot["close"]) / candle_range > 0.45)
-            & ((snapshot["high"] - snapshot["close"]) / snapshot["close"].replace(0, pd.NA) > 0.03)
-        ).fillna(False)
-        snapshot["score"] = 50.0
-        conditions = [
-            (snapshot["volume_ratio_20d"] > 3) & snapshot["long_upper_shadow"],
-            (snapshot["volume_ratio_20d"] > 2.5) & (snapshot["close"] < snapshot["open"]) & (snapshot["return_1d"] < -0.03),
-            (snapshot["volume_ratio_20d"] > 1.5) & (snapshot["return_1d"] < 0.01),
-            (snapshot["volume_ratio_20d"].between(1.2, 2.5, inclusive="both")) & (snapshot["return_1d"] > 0),
-            (snapshot["volume_ratio_20d"] < 0.8) & (snapshot["return_1d"] < 0) & (snapshot["close"] > snapshot["ma10"]),
-            (snapshot["volume_ratio_20d"] < 0.8) & (snapshot["return_1d"] > 0),
-        ]
-        scores = [10.0, 10.0, 25.0, 90.0, 80.0, 60.0]
-        remaining = pd.Series(True, index=snapshot.index)
-        for condition, score in zip(conditions, scores, strict=True):
-            hits = remaining & condition.fillna(False)
-            snapshot.loc[hits, "score"] = score
-            remaining &= ~hits
-        snapshot["score"] = snapshot["score"].clip(0, 100).round(2)
+        snapshot["long_upper_shadow"] = long_upper_shadow_flag(
+            snapshot["open"], snapshot["high"], snapshot["low"], snapshot["close"]
+        )
+        snapshot["score"] = self._smooth_score(snapshot)
         columns = [
             "stock_code",
             "trade_date",
@@ -79,3 +92,43 @@ class VolumeFactor:
             "long_upper_shadow",
         ]
         return snapshot[columns].reset_index(drop=True)
+
+    @staticmethod
+    def _smooth_score(snapshot: pd.DataFrame) -> pd.Series:
+        volume_ratio = pd.to_numeric(snapshot["volume_ratio_20d"], errors="coerce")
+        return_1d = pd.to_numeric(snapshot["return_1d"], errors="coerce").fillna(0.0)
+        close = pd.to_numeric(snapshot["close"], errors="coerce")
+        open_price = pd.to_numeric(snapshot["open"], errors="coerce")
+        high = pd.to_numeric(snapshot["high"], errors="coerce")
+        low = pd.to_numeric(snapshot["low"], errors="coerce")
+        ma10 = pd.to_numeric(snapshot["ma10"], errors="coerce")
+
+        # Intensity of the up/down move, saturating at +-1% (down) and +2% (up).
+        up_move = _ramp(return_1d, 0.0, 0.02)
+        down_move = _ramp(-return_1d, 0.0, 0.01)
+        # Volume regimes: expansion saturates at 1.5x, blow-off builds from 2.5x to 3.5x.
+        expansion = _ramp(volume_ratio, 0.8, 1.5)
+        blowoff = _ramp(volume_ratio, 2.5, 3.5)
+        shrink = 1.0 - _ramp(volume_ratio, 0.7, 0.95)
+        above_ma10 = (close > ma10).fillna(False).to_numpy(dtype=float)
+
+        body_top = pd.concat([open_price, close], axis=1).max(axis=1)
+        candle_range = (high - low).replace(0, np.nan)
+        shadow_ratio = ((high - body_top) / candle_range).fillna(0.0)
+        shadow_pct = ((high - body_top) / close.replace(0, np.nan)).fillna(0.0)
+        shadow_severity = _ramp(shadow_ratio, 0.30, 0.55) * _ramp(shadow_pct, 0.015, 0.04)
+        bearish_candle = (close < open_price).fillna(False).to_numpy(dtype=float)
+
+        score = np.full(len(snapshot), 50.0)
+        # Healthy expansion with an up move is the core confirmation pattern.
+        score += 40.0 * up_move * expansion * (1.0 - blowoff)
+        # Shrinking volume: gentle pullback above MA10 is constructive, drift-up is mildly positive.
+        score += 30.0 * down_move * shrink * above_ma10
+        score += 20.0 * up_move * shrink
+        # Risk patterns: blow-off surge, heavy-volume decline, stagnation, long upper shadow.
+        score -= 30.0 * blowoff * up_move
+        score -= 35.0 * down_move * expansion * bearish_candle
+        score -= 25.0 * expansion * (1.0 - up_move) * (1.0 - down_move)
+        score -= 35.0 * shadow_severity * _ramp(volume_ratio, 1.5, 3.0)
+
+        return pd.Series(score, index=snapshot.index).clip(0, 100).round(2)

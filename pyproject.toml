@@ -14,6 +14,7 @@ dependencies = [
   "pyarrow>=14.0",
   "pyyaml>=6.0",
   "requests>=2.31",
+  "baostock>=0.8.9",
   "mootdx>=0.10",
   "stockstats>=0.6",
   "tqdm>=4.66",

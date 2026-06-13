@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from astock_quant.features.volume import long_upper_shadow_flag
 from astock_quant.utils.calendar import ensure_no_future_data
 
 
@@ -37,11 +38,9 @@ class PatternFactor:
         snapshot["above_ma20"] = snapshot["close"] > snapshot["ma20"]
         snapshot["breakout_20d_high"] = snapshot["close"] >= snapshot["rolling_20d_high_prev"].fillna(snapshot["high"])
         snapshot["close_near_high"] = (snapshot["high"] - snapshot["close"]) / snapshot["close"].replace(0, np.nan) <= 0.02
-        candle_range = (snapshot["high"] - snapshot["low"]).replace(0, np.nan)
-        snapshot["long_upper_shadow"] = (
-            ((snapshot["high"] - snapshot["close"]) / candle_range > 0.45)
-            & ((snapshot["high"] - snapshot["close"]) / snapshot["close"].replace(0, np.nan) > 0.03)
-        ).fillna(False)
+        snapshot["long_upper_shadow"] = long_upper_shadow_flag(
+            snapshot["open"], snapshot["high"], snapshot["low"], snapshot["close"]
+        )
         daily_return = snapshot["close"] / snapshot["prev_close_calc"].replace(0, np.nan) - 1
         volume_ratio = snapshot["turnover_amount"] / snapshot["avg_turnover_amount_20d"].replace(0, np.nan)
         snapshot["high_volume_stagnation"] = ((volume_ratio > 1.5) & (daily_return.fillna(0) < 0.01)).fillna(False)

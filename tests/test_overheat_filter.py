@@ -148,7 +148,7 @@ def test_run_selection_filters_overheated_candidate_and_saves_rejected(monkeypat
     monkeypatch.setattr(
         run_selection_module,
         "SentimentFactor",
-        lambda: _FactorStub(pd.DataFrame([{"stock_code": hot, "trade_date": trade_date, "score": 90, "market_regime": "strong"}, {"stock_code": cool, "trade_date": trade_date, "score": 90, "market_regime": "strong"}])),
+        lambda *args, **kwargs: _FactorStub(pd.DataFrame([{"stock_code": hot, "trade_date": trade_date, "score": 90, "market_regime": "strong"}, {"stock_code": cool, "trade_date": trade_date, "score": 90, "market_regime": "strong"}])),
     )
     config = {
         "data": {"result_path": str(tmp_path), "processed_path": str(tmp_path), "raw_path": str(tmp_path), "report_path": str(tmp_path)},

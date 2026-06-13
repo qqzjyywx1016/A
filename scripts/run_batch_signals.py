@@ -36,6 +36,8 @@ SIGNAL_COLUMNS = [
     "sector_rps_5",
     "sector_rps_10",
     "sector_rps_composite",
+    "suggested_position",
+    "target_total_position",
 ]
 
 

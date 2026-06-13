@@ -219,6 +219,40 @@ def test_multi_sector_stock_uses_highest_composite_as_active_sector():
     assert row["active_sector_rps"] == 100
 
 
+def test_sector_factor_excludes_concept_sector_in_backtest_when_disabled():
+    bars, sector_map, sector_daily = _sector_fixture()
+    extra_map = pd.DataFrame(
+        [
+            {
+                "stock_code": "600001.SH",
+                "sector_code": "BK006",
+                "sector_name": "板块6",
+                "sector_type": "concept",
+            }
+        ]
+    )
+    sector_map = pd.concat([sector_map, extra_map], ignore_index=True)
+    trade_date = bars["trade_date"].max().strftime("%Y-%m-%d")
+    config = {
+        **_sector_config(),
+        "mode": "backtest",
+        "backtest_sector_type": "industry",
+        "use_concept_in_backtest": False,
+        "require_effective_date_for_concept_backtest": True,
+    }
+
+    result = SectorFactor(config).calculate(
+        bars,
+        trade_date=trade_date,
+        sector_map=sector_map,
+        sector_daily=sector_daily,
+    )
+
+    row = result[result["stock_code"] == "600001.SH"].iloc[0]
+    assert row["active_sector_code"] == "BK001"
+    assert row["active_sector_type"] == "industry"
+
+
 def test_selector_applies_market_regime_sector_rps_thresholds():
     selector = StockSelector(_selector_config())
     rows = pd.DataFrame(

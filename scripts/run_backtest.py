@@ -45,6 +45,7 @@ def main() -> None:
     benchmark_curve = build_benchmark_curve(adapter.get_index_bars(args.start, args.end), config.get("backtest", {}))
     backtest_config = dict(config.get("backtest", {}))
     backtest_config.setdefault("continue_hold", config.get("continue_hold", {}))
+    backtest_config.setdefault("buy_rules", config.get("buy_rules", {}))
     result = BacktestEngine(backtest_config).run(bars, signals, benchmark_curve=benchmark_curve)
     storage.save_backtest_trades(result.trades)
     storage.save_backtest_equity(result.equity_curve)

@@ -20,3 +20,6 @@ class Trade:
     reason: str
     pnl: float = 0.0
     holding_days: int = 0
+    limit_blocked: bool = False
+    deferred_days: int = 0
+    gap_exit: bool = False

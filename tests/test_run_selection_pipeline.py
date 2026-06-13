@@ -137,7 +137,7 @@ def test_run_selection_uses_in_memory_market_data_and_slices_future_rows(monkeyp
     monkeypatch.setattr(
         run_selection_module,
         "SentimentFactor",
-        lambda: _FactorStub(pd.DataFrame([{**base, "score": 90, "market_regime": "strong"}])),
+        lambda *args, **kwargs: _FactorStub(pd.DataFrame([{**base, "score": 90, "market_regime": "strong"}])),
     )
     config = {
         "data": {"result_path": str(tmp_path), "processed_path": str(tmp_path), "raw_path": str(tmp_path), "report_path": str(tmp_path)},

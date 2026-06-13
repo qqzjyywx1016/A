@@ -38,11 +38,11 @@ class ReversalFactor:
         snapshot["pullback_score"] = self._pullback_score(snapshot["pullback"])
         diff = snapshot["return_1d"] - snapshot["prev_return_4d_mean"].fillna(snapshot["return_1d"])
         snapshot["decel_score"] = np.where(diff > 0, 100.0, (100 + diff * 1000).clip(0, 100))
-        snapshot["shrink_score"] = np.where(
-            snapshot["turnover_amount"] < snapshot["avg_turnover_amount_10d"] * 0.7,
-            100.0,
-            0.0,
-        )
+        # Linear ramp instead of a 0/100 cliff at 0.7x: full credit at <=0.6x average
+        # volume, fading to zero at >=1.05x, so a marginal volume change cannot
+        # flip 20% of the factor score.
+        shrink_ratio = snapshot["turnover_amount"] / snapshot["avg_turnover_amount_10d"].replace(0, np.nan)
+        snapshot["shrink_score"] = ((1.05 - shrink_ratio) / 0.45 * 100).clip(0, 100).fillna(0.0)
         snapshot["reversal_score"] = (
             snapshot["pullback_score"] * 0.50 + snapshot["decel_score"] * 0.30 + snapshot["shrink_score"] * 0.20
         ).clip(0, 100).round(2)

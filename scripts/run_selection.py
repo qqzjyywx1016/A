@@ -28,6 +28,7 @@ from astock_quant.features.volume import VolumeFactor
 from astock_quant.scoring.score_engine import ScoreEngine
 from astock_quant.strategy.buy_rules import BuyRuleEngine
 from astock_quant.strategy.overheat_filter import OverheatFilter
+from astock_quant.strategy.position import PositionSizer
 from astock_quant.strategy.selector import StockSelector
 from astock_quant.universe.filters import UniverseFilter
 
@@ -39,6 +40,14 @@ def selection_config(config: dict) -> dict:
     merged["rps"] = config.get("rps", {})
     if "sector_rps" in config:
         merged["sector_rps"] = config.get("sector_rps", {})
+    return merged
+
+
+def sector_factor_config(config: dict) -> dict:
+    """Merge sector RPS scoring config with backtest/live sector availability guard."""
+
+    merged = dict(config.get("sector_rps", {}))
+    merged.update(config.get("sector", {}))
     return merged
 
 
@@ -91,7 +100,7 @@ def run_selection(
     allowed_codes = set(universe["stock_code"]) if not universe.empty else set()
 
     market_codes = daily_bars["stock_code"].dropna().drop_duplicates().tolist()
-    sector_factor = SectorFactor(config.get("sector_rps", {})).calculate(
+    sector_factor = SectorFactor(sector_factor_config(config)).calculate(
         daily_bars,
         trade_date=trade_date,
         sector_map=sector_map,
@@ -112,7 +121,12 @@ def run_selection(
         "reversal": ReversalFactor().calculate(daily_bars, trade_date=trade_date),
         "fund_flow": FundFlowFactor().calculate(fund_flow, trade_date=trade_date, stock_codes=market_codes),
         "pattern": PatternFactor().calculate(daily_bars, trade_date=trade_date),
-        "sentiment": SentimentFactor().calculate(daily_bars, trade_date=trade_date, limit_status=limit_status),
+        "sentiment": SentimentFactor(config.get("sentiment", {})).calculate(
+            daily_bars,
+            trade_date=trade_date,
+            limit_status=limit_status,
+            index_bars=index_bars,
+        ),
     }
     scored = ScoreEngine(config.get("score_weights", {})).score(factors, stock_basic)
     if allowed_codes:
@@ -125,8 +139,20 @@ def run_selection(
     overheat_config = config.get("overheat")
     if isinstance(overheat_config, dict) and overheat_config.get("enabled", True) and not scored.empty:
         scored, rejected = OverheatFilter(overheat_config).apply(scored)
+    # Rating-based sizing runs before selection so the selector's sector-exposure
+    # cap sees real suggested_position values and the backtest can honor them.
+    if not scored.empty and "rating" in scored.columns:
+        market_regime = "neutral"
+        if "market_regime" in scored.columns and not scored["market_regime"].dropna().empty:
+            market_regime = str(scored["market_regime"].dropna().mode().iloc[0])
+        scored = PositionSizer(config.get("position", {})).suggest(scored, market_regime=market_regime)
     selected = StockSelector(selection_config(config)).select(scored, trade_date=trade_date)["watch_pool"]
-    selected = BuyRuleEngine().generate(selected)
+    plan_fields = [column for column in ["stock_code", "close", "high", "ma5", "ma10"] if column in latest.columns]
+    if not selected.empty and len(plan_fields) > 1:
+        selected = selected.merge(
+            latest[plan_fields].drop_duplicates("stock_code"), on="stock_code", how="left", suffixes=("", "_bar")
+        )
+    selected = BuyRuleEngine(config.get("buy_rules", {})).generate(selected)
     if save:
         storage.save_daily_selection(selected, trade_date)
         storage.save_rejected_candidates(rejected, trade_date)
@@ -150,6 +176,10 @@ def enrich_daily_bars_for_selection(daily_bars: pd.DataFrame) -> pd.DataFrame:
         )
     if "turnover_rate" in result.columns and "avg_turnover_rate_20d" not in result.columns:
         result["avg_turnover_rate_20d"] = grouped["turnover_rate"].transform(lambda s: s.rolling(20, min_periods=1).mean())
+    for period in [5, 10]:
+        column = f"ma{period}"
+        if column not in result.columns:
+            result[column] = grouped["close"].transform(lambda s, p=period: s.rolling(p, min_periods=1).mean())
     return result
 
 

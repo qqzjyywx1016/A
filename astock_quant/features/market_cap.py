@@ -43,16 +43,30 @@ class MarketCapFactor:
             return pd.DataFrame(columns=["stock_code", "trade_date", "score", "market_cap_score"])
 
         result["float_market_cap"] = pd.to_numeric(result.get("float_market_cap"), errors="coerce")
+        if result["float_market_cap"].isna().all():
+            result["tier_score"] = 50.0
+            result["sector_bonus"] = 0.0
+            result["market_cap_score"] = 50.0
+            result["score"] = 50.0
+            columns = [
+                "stock_code",
+                "trade_date",
+                "score",
+                "market_cap_score",
+                "float_market_cap",
+                "tier_score",
+                "sector_bonus",
+            ]
+            return result[[column for column in columns if column in result.columns]].reset_index(drop=True)
         cap = result["float_market_cap"]
-        result["tier_score"] = np.select(
-            [
-                (cap >= 3_000_000_000) & (cap < 8_000_000_000),
-                (cap >= 8_000_000_000) & (cap < 20_000_000_000),
-                (cap >= 20_000_000_000) & (cap < 50_000_000_000),
-                cap >= 50_000_000_000,
-            ],
-            [100.0, 85.0, 65.0, 50.0],
-            default=50.0,
+        # Piecewise-linear interpolation between tier knots instead of step
+        # functions, so 7.9B vs 8.1B float cap no longer jumps 15 points.
+        tier_knots_cap = [3_000_000_000, 8_000_000_000, 20_000_000_000, 50_000_000_000]
+        tier_knots_score = [100.0, 85.0, 65.0, 50.0]
+        result["tier_score"] = np.where(
+            cap.notna(),
+            np.interp(cap.fillna(0.0), tier_knots_cap, tier_knots_score),
+            50.0,
         )
 
         amount_score = self._rank_or_neutral(result.get("avg_turnover_amount_20d"), result.index)

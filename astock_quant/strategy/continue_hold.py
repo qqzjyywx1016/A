@@ -18,6 +18,16 @@ class ContinueHoldDecision:
     components: dict[str, int]
 
 
+def _flag(value: object) -> bool:
+    """Coerce a possibly-NaN flag to bool; missing data must not count as a risk signal."""
+
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    if pd.api.types.is_scalar(value) and pd.isna(value):
+        return False
+    return bool(value)
+
+
 class ContinueHoldScorer:
     """Score whether a position still deserves to be held."""
 
@@ -28,9 +38,22 @@ class ContinueHoldScorer:
         self.exit_below = int(self.config.get("exit_below", 6))
 
     def can_evaluate(self, market_row: pd.Series) -> bool:
-        """Return True when the row has the core columns required for scoring."""
+        """Return True only when every core field is present AND non-NaN.
 
-        return self.REQUIRED_COLUMNS.issubset(set(market_row.index))
+        A held stock that drops out of the scored panel for a day produces rows
+        where the columns exist but the values are NaN; scoring those rows would
+        force a bogus low-score exit, so the caller must fall back to the rule engine.
+        """
+
+        if not self.REQUIRED_COLUMNS.issubset(set(market_row.index)):
+            return False
+        for column in self.REQUIRED_COLUMNS:
+            value = market_row[column]
+            if value is None:
+                return False
+            if pd.api.types.is_scalar(value) and pd.isna(value):
+                return False
+        return True
 
     def evaluate(self, market_row: pd.Series) -> ContinueHoldDecision:
         """Return the 0-10 continue-hold score and action."""
@@ -87,9 +110,9 @@ class ContinueHoldScorer:
 
     @staticmethod
     def _volume_price_health_score(row: pd.Series) -> int:
-        high_volume_bearish = bool(row.get("high_volume_bearish", False))
-        high_volume_stagnation = bool(row.get("high_volume_stagnation", False))
-        long_upper_shadow = bool(row.get("long_upper_shadow", False))
+        high_volume_bearish = _flag(row.get("high_volume_bearish", False))
+        high_volume_stagnation = _flag(row.get("high_volume_stagnation", False))
+        long_upper_shadow = _flag(row.get("long_upper_shadow", False))
         if high_volume_bearish or high_volume_stagnation:
             return 0
         if long_upper_shadow:
@@ -99,7 +122,7 @@ class ContinueHoldScorer:
     @staticmethod
     def _risk_score(row: pd.Series) -> int:
         market_regime = str(row.get("market_regime", "neutral")).lower()
-        major_risk = bool(row.get("is_major_event", False)) or bool(row.get("is_restructuring", False))
+        major_risk = _flag(row.get("is_major_event", False)) or _flag(row.get("is_restructuring", False))
         if market_regime == "risk_off" or major_risk:
             return 0
         if market_regime == "weak":
