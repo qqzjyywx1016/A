@@ -1,0 +1,18 @@
+# Normalize line endings: store LF in the repo and check out LF everywhere,
+# including Windows. Python and the tooling here all handle LF fine, and this
+# stops phantom CRLF "modified" files when editing on macOS and running on
+# Windows from blocking git pull.
+* text=auto eol=lf
+
+# Keep genuinely binary types byte-for-byte (never normalized), in case any are
+# tracked later. The data/ outputs are gitignored, so these are defensive.
+*.parquet binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.whl binary
+*.xlsx binary
