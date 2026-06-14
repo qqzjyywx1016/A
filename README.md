@@ -89,12 +89,30 @@ python -c "import pandas as pd; df=pd.read_parquet('data/processed/daily_bars.pa
 ```
 重点看:`adjust_type` 是否为 `qfq`;`pct_chg` 是否为小数(如 0.03 而非 3.0);`close` 是否是前复权价(连续、无除权跳变)。
 
-### 6. 数据质检准入门槛
+### 6. 拉全市场(放着过夜跑,带限速)
+
+冒烟没问题后,**不传 `--codes` 就是全市场**:脚本用 `query_all_stock` 枚举全市场(含历年退市股,减轻幸存者偏差),逐只拉前复权日线。全市场约 5000+ 只,每只要查 basic / daily / industry 三次,适合晚上挂着跑。
+
+为避免被限制,加了限速参数(全部可选,默认不休眠以兼容小样本):
+
+- `--sleep`:每只票请求之间停顿秒数(如 `0.5`)。
+- `--batch-size` + `--batch-rest`:每拉 N 只就长休一次(如每 200 只休 60 秒),即"拉一会休息一会"。
+- `--jitter`:把每次停顿随机抖动 ±该比例(默认 0.2),让节奏不固定。
+
+建议的过夜命令(慢而稳,从 2022 年起覆盖完整熊市与两次风格切换):
 
 ```powershell
-python scripts\validate_real_data.py --start 2024-01-01 --end 2024-06-30
+python scripts\ingest_baostock.py --start 2022-01-01 --end 2026-06-30 --sleep 0.6 --batch-size 200 --batch-rest 60
 ```
-打印 `OK: data validation passed hard gates` 才允许进入后续回测;`BLOCKED` 则按提示修数据。
+
+**断点续传已内置**:中途断了、被限了、或电脑睡眠了,直接**重跑同一条命令**即可——已拉全的票会自动跳过(`skip ... existing coverage`),`--save-every`(默认 50)会定期落盘,不会白拉。跑完看末尾打印的 `daily_bars rows=...` 和失败汇总。
+
+### 7. 数据质检准入门槛
+
+```powershell
+python scripts\validate_real_data.py --start 2022-01-01 --end 2026-06-30
+```
+打印 `OK: data validation passed hard gates` 才允许进入后续回测;`BLOCKED` 则按提示修数据。(小样本验证仍用对应的小区间日期。)
 
 ### 常见问题
 

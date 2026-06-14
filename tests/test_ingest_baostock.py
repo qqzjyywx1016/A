@@ -1,6 +1,7 @@
 import pandas as pd
 
 from scripts.ingest_baostock import (
+    Throttle,
     _ingest_daily_bars_incremental,
     _enumerate_stock_codes,
     _fetch_sector_map,
@@ -401,6 +402,91 @@ def test_build_arg_parser_has_timeout_and_save_every_defaults():
 
     assert args.timeout == 30
     assert args.save_every == 50
+    assert args.sleep == 0.0
+    assert args.batch_size == 0
+    assert args.batch_rest == 0.0
+    assert args.jitter == 0.2
+
+
+def test_build_arg_parser_parses_throttle_flags():
+    args = build_arg_parser().parse_args(
+        ["--start", "2024-01-01", "--end", "2024-06-30", "--sleep", "0.5", "--batch-size", "200", "--batch-rest", "60"]
+    )
+
+    assert args.sleep == 0.5
+    assert args.batch_size == 200
+    assert args.batch_rest == 60.0
+
+
+def test_throttle_default_is_noop():
+    slept = []
+    throttle = Throttle(_sleep=slept.append)
+
+    for _ in range(5):
+        throttle.tick()
+
+    assert slept == []
+
+
+def test_throttle_sleeps_between_requests_without_jitter():
+    slept = []
+    throttle = Throttle(sleep_seconds=0.5, jitter=0.0, _sleep=slept.append)
+
+    for _ in range(3):
+        throttle.tick()
+
+    assert slept == [0.5, 0.5, 0.5]
+
+
+def test_throttle_takes_long_rest_every_batch():
+    slept = []
+    throttle = Throttle(sleep_seconds=0.5, batch_size=3, batch_rest_seconds=60.0, jitter=0.0, _sleep=slept.append)
+
+    for _ in range(6):
+        throttle.tick()
+
+    # Short pause on requests 1,2,4,5; long rest on requests 3 and 6.
+    assert slept == [0.5, 0.5, 60.0, 0.5, 0.5, 60.0]
+
+
+def test_throttle_jitter_stays_within_bounds():
+    slept = []
+    throttle = Throttle(sleep_seconds=1.0, jitter=0.2, _sleep=slept.append, _rand=lambda lo, hi: hi)
+
+    throttle.tick()
+
+    assert slept == [1.2]
+
+
+def test_fetch_stock_basic_ticks_throttle_per_code():
+    class FakeResultSet:
+        def __init__(self):
+            self._done = False
+
+        @property
+        def error_code(self):
+            return "0"
+
+        fields = ["code", "code_name", "ipoDate", "outDate", "type", "status"]
+
+        def next(self):
+            if self._done:
+                return False
+            self._done = True
+            return True
+
+        def get_row_data(self):
+            return ["sh.600000", "x", "2000-01-01", "", "1", "1"]
+
+    class FakeBaostock:
+        def query_stock_basic(self, code):
+            return FakeResultSet()
+
+    slept = []
+    throttle = Throttle(sleep_seconds=0.3, jitter=0.0, _sleep=slept.append)
+    _fetch_stock_basic(FakeBaostock(), True, ["sh.600000", "sz.000001"], None, throttle=throttle)
+
+    assert slept == [0.3, 0.3]
 
 
 def test_daily_ingest_skips_failed_code_and_incrementally_saves(tmp_path):

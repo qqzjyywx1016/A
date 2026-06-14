@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,44 @@ import pandas as pd
 
 from astock_quant.config.loader import load_config
 from astock_quant.data.storage import StorageManager
+
+
+@dataclass
+class Throttle:
+    """Pace per-stock baostock requests for long overnight full-market pulls.
+
+    After every request the caller invokes ``tick()``. A short ``sleep_seconds``
+    pause is taken between requests; every ``batch_size`` requests a longer
+    ``batch_rest_seconds`` pause is taken instead (the "pull a while, rest a
+    while" pattern). ``jitter`` randomizes each pause by +-fraction so the
+    cadence is not a fixed robotic interval. All-zero defaults make ``tick()``
+    a no-op, so small-sample runs behave exactly as before.
+    """
+
+    sleep_seconds: float = 0.0
+    batch_size: int = 0
+    batch_rest_seconds: float = 0.0
+    jitter: float = 0.2
+    _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    _rand: Callable[[float, float], float] = field(default=random.uniform, repr=False)
+    _count: int = field(default=0, repr=False)
+
+    def tick(self) -> None:
+        """Account for one completed request and pause according to the policy."""
+
+        self._count += 1
+        if self.batch_size > 0 and self.batch_rest_seconds > 0 and self._count % self.batch_size == 0:
+            rest = self._with_jitter(self.batch_rest_seconds)
+            print(f"batch rest: sleeping {rest:.1f}s after {self._count} requests")
+            self._sleep(rest)
+        elif self.sleep_seconds > 0:
+            self._sleep(self._with_jitter(self.sleep_seconds))
+
+    def _with_jitter(self, base: float) -> float:
+        if self.jitter <= 0:
+            return base
+        delta = base * self.jitter
+        return max(0.0, base + self._rand(-delta, delta))
 
 DAILY_FIELDS = (
     "date,code,open,high,low,close,preclose,volume,amount,turn,"
@@ -273,6 +313,12 @@ def run_ingest(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     storage = StorageManager(config)
     baostock_codes = _parse_codes(args.codes)
+    throttle = Throttle(
+        sleep_seconds=args.sleep,
+        batch_size=args.batch_size,
+        batch_rest_seconds=args.batch_rest,
+        jitter=args.jitter,
+    )
     failed: dict[str, list[str]] = {"stock_basic": [], "daily": [], "industry": []}
     _login_with_retry(bs)
 
@@ -285,6 +331,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             start_date=args.start,
             end_date=args.end,
             failed_codes=failed["stock_basic"],
+            throttle=throttle,
         )
         stock_basic = normalize_stock_basic(stock_basic_raw)
         storage.save_parquet(stock_basic, "stock_basic.parquet")
@@ -300,10 +347,13 @@ def run_ingest(args: argparse.Namespace) -> int:
             args.end,
             args.save_every,
             failed["daily"],
+            throttle=throttle,
         )
         print(f"daily_bars rows={len(daily_bars)}")
 
-        sector_raw = _fetch_sector_map(bs, stock_basic_raw["code"].tolist(), failed_codes=failed["industry"])
+        sector_raw = _fetch_sector_map(
+            bs, stock_basic_raw["code"].tolist(), failed_codes=failed["industry"], throttle=throttle
+        )
         sector_map = normalize_sector_map(sector_raw)
         storage.save_parquet(sector_map, "sector_map.parquet")
         print(f"sector_map rows={len(sector_map)}")
@@ -332,6 +382,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="Config path")
     parser.add_argument("--timeout", type=float, default=30, help="Socket timeout seconds for baostock calls")
     parser.add_argument("--save-every", type=int, default=50, help="Persist daily bars after this many successful stocks")
+    parser.add_argument(
+        "--sleep", type=float, default=0.0, help="Seconds to pause between per-stock requests (e.g. 0.5)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Take a longer rest after this many requests (0 disables batch rest)",
+    )
+    parser.add_argument(
+        "--batch-rest",
+        type=float,
+        default=0.0,
+        help="Seconds to rest between batches when --batch-size is set (e.g. 60)",
+    )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=0.2,
+        help="Randomize each pause by +-this fraction so the cadence is not fixed",
+    )
     return parser
 
 
@@ -424,6 +495,7 @@ def _fetch_stock_basic(
     end_date: str | None = None,
     failed_codes: list[str] | None = None,
     retries: int = 3,
+    throttle: Throttle | None = None,
 ) -> pd.DataFrame:
     selected_codes = list(dict.fromkeys(codes))
     if not selected_codes:
@@ -443,9 +515,13 @@ def _fetch_stock_basic(
             print(f"WARNING stock basic {code} skipped: {exc}")
             if failed_codes is not None:
                 failed_codes.append(code)
+            if throttle is not None:
+                throttle.tick()
             continue
         if not frame.empty:
             frames.append(frame)
+        if throttle is not None:
+            throttle.tick()
 
     if not frames:
         return pd.DataFrame(columns=["code", "code_name", "ipoDate", "outDate", "type", "status"])
@@ -508,7 +584,13 @@ def _query_all_stock_with_fallback(bs: Any, day: str, max_backtrack_days: int = 
     raise RuntimeError(f"query_all_stock found no data near {day}") from last_error
 
 
-def _fetch_sector_map(bs: Any, codes: list[str], failed_codes: list[str] | None = None, retries: int = 3) -> pd.DataFrame:
+def _fetch_sector_map(
+    bs: Any,
+    codes: list[str],
+    failed_codes: list[str] | None = None,
+    retries: int = 3,
+    throttle: Throttle | None = None,
+) -> pd.DataFrame:
     rows = []
     fields: list[str] | None = None
     for idx, code in enumerate(codes, start=1):
@@ -520,13 +602,19 @@ def _fetch_sector_map(bs: Any, codes: list[str], failed_codes: list[str] | None 
             if failed_codes is not None:
                 failed_codes.append(code)
             rows.append({"code": code, "industry": "unknown"})
+            if throttle is not None:
+                throttle.tick()
             continue
         if frame.empty:
             rows.append({"code": code, "industry": "unknown"})
+            if throttle is not None:
+                throttle.tick()
             continue
         if fields is None:
             fields = list(frame.columns)
         rows.extend(frame.to_dict("records"))
+        if throttle is not None:
+            throttle.tick()
     if not rows:
         return pd.DataFrame(columns=["code", "industry"])
     result = pd.DataFrame(rows)
@@ -571,6 +659,7 @@ def _ingest_daily_bars_incremental(
     save_every: int,
     failed_codes: list[str],
     retries: int = 3,
+    throttle: Throttle | None = None,
 ) -> pd.DataFrame:
     persisted = _merge_existing_daily(existing_daily, [])
     fetched_daily: list[pd.DataFrame] = []
@@ -596,11 +685,15 @@ def _ingest_daily_bars_incremental(
         except RuntimeError as exc:
             print(f"WARNING daily {code} skipped: {exc}")
             failed_codes.append(code)
+            if throttle is not None:
+                throttle.tick()
             continue
         normalized = normalize_daily_bars(raw_bars)
         fetched_daily.append(normalized)
         successful_since_save += 1
         print(f"[{idx}/{len(codes)}] {code} daily rows={len(normalized)}")
+        if throttle is not None:
+            throttle.tick()
         if successful_since_save >= flush_every:
             persisted = _merge_existing_daily(persisted, fetched_daily)
             storage.save_parquet(persisted, "daily_bars.parquet")
