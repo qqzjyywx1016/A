@@ -348,6 +348,7 @@ def run_ingest(args: argparse.Namespace) -> int:
             args.save_every,
             failed["daily"],
             throttle=throttle,
+            relogin_every=args.relogin_every,
         )
         print(f"daily_bars rows={len(daily_bars)}")
 
@@ -402,6 +403,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.2,
         help="Randomize each pause by +-this fraction so the cadence is not fixed",
+    )
+    parser.add_argument(
+        "--relogin-every",
+        type=int,
+        default=0,
+        help="Proactively re-login to baostock every N daily requests (0 disables)",
     )
     return parser
 
@@ -463,7 +470,72 @@ def _login_with_retry(bs: Any, retries: int = 3, sleep: Callable[[float], None] 
     raise RuntimeError(f"baostock login failed after {retries} attempts: {last_error}")
 
 
-def _query_result(factory: Callable[..., Any], label: str, *args: Any, retries: int = 3, **kwargs: Any) -> pd.DataFrame:
+# baostock keeps one long-lived socket; these substrings flag the receive/reset
+# errors that mean that socket is dead and only a re-login (not a plain retry)
+# can recover it.
+_CONNECTION_ERROR_HINTS = (
+    "10054",
+    "10053",
+    "10060",
+    "10002007",
+    "网络接收",
+    "接收数据异常",
+    "发送数据异常",
+    "强迫关闭",
+    "网络连接",
+    "connection",
+    "reset",
+    "timed out",
+    "broken pipe",
+    "recv",
+)
+
+
+def _looks_like_connection_error(error: object) -> bool:
+    """Return True when the error text looks like a dropped baostock socket."""
+
+    text = str(error).lower()
+    return any(hint.lower() in text for hint in _CONNECTION_ERROR_HINTS)
+
+
+def _relogin(bs: Any, sleep: Callable[[float], None] | None = None) -> None:
+    """Drop and re-establish the baostock session after a connection error.
+
+    Retrying a query on the same dead socket fails forever (the cascade of
+    receive errors seen on long full-market pulls). Logging out and back in
+    gives subsequent queries a fresh socket.
+    """
+
+    do_sleep = sleep if sleep is not None else time.sleep
+    try:
+        bs.logout()
+    except Exception as exc:  # pragma: no cover - best effort cleanup
+        print(f"relogin: logout failed (ignored): {exc}")
+    do_sleep(2.0)
+    _login_with_retry(bs, sleep=do_sleep)
+    print("relogin: re-established baostock session")
+
+
+def _proactive_relogin(bs: Any, processed: int, relogin_every: int) -> None:
+    """Refresh the session every ``relogin_every`` requests, before it goes stale."""
+
+    if bs is None or relogin_every <= 0 or processed <= 0 or processed % relogin_every != 0:
+        return
+    print(f"proactive relogin after {processed} requests to refresh the baostock session")
+    try:
+        _relogin(bs)
+    except Exception as exc:  # pragma: no cover - live path
+        print(f"proactive relogin failed: {exc}")
+
+
+def _query_result(
+    factory: Callable[..., Any],
+    label: str,
+    *args: Any,
+    retries: int = 3,
+    bs: Any | None = None,
+    **kwargs: Any,
+) -> pd.DataFrame:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -483,6 +555,13 @@ def _query_result(factory: Callable[..., Any], label: str, *args: Any, retries: 
             print(f"{label} attempt {attempt}/{retries} failed: {exc}")
             if attempt < retries:
                 time.sleep(min(2**attempt, 10))
+                # On a dead socket a plain retry is hopeless; re-login first.
+                if bs is not None and _looks_like_connection_error(exc):
+                    print(f"{label}: connection looks dead, re-logging into baostock before retry")
+                    try:
+                        _relogin(bs)
+                    except Exception as relogin_exc:  # pragma: no cover - live path
+                        print(f"{label}: relogin failed: {relogin_exc}")
     raise RuntimeError(f"{label} failed after {retries} attempts") from last_error
 
 
@@ -510,7 +589,7 @@ def _fetch_stock_basic(
     for idx, code in enumerate(selected_codes, start=1):
         print(f"[{idx}/{len(selected_codes)}] stock basic {code}")
         try:
-            frame = _query_result(bs.query_stock_basic, f"stock basic {code}", retries=retries, code=code)
+            frame = _query_result(bs.query_stock_basic, f"stock basic {code}", retries=retries, bs=bs, code=code)
         except RuntimeError as exc:
             print(f"WARNING stock basic {code} skipped: {exc}")
             if failed_codes is not None:
@@ -573,7 +652,7 @@ def _query_all_stock_with_fallback(bs: Any, day: str, max_backtrack_days: int = 
     for offset in range(max_backtrack_days + 1):
         query_day = (current - pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
         try:
-            frame = _query_result(bs.query_all_stock, f"all stock {query_day}", day=query_day)
+            frame = _query_result(bs.query_all_stock, f"all stock {query_day}", bs=bs, day=query_day)
         except RuntimeError as exc:
             last_error = exc
             continue
@@ -596,7 +675,7 @@ def _fetch_sector_map(
     for idx, code in enumerate(codes, start=1):
         print(f"[{idx}/{len(codes)}] stock industry {code}")
         try:
-            frame = _query_result(bs.query_stock_industry, f"stock industry {code}", retries=retries, code=code)
+            frame = _query_result(bs.query_stock_industry, f"stock industry {code}", retries=retries, bs=bs, code=code)
         except RuntimeError as exc:
             print(f"stock industry {code} fallback unknown: {exc}")
             if failed_codes is not None:
@@ -642,6 +721,7 @@ def _query_history(
         code,
         fields,
         retries=retries,
+        bs=bs,
         start_date=start_date,
         end_date=end_date,
         frequency="d",
@@ -660,10 +740,12 @@ def _ingest_daily_bars_incremental(
     failed_codes: list[str],
     retries: int = 3,
     throttle: Throttle | None = None,
+    relogin_every: int = 0,
 ) -> pd.DataFrame:
     persisted = _merge_existing_daily(existing_daily, [])
     fetched_daily: list[pd.DataFrame] = []
     successful_since_save = 0
+    requests_made = 0
     flush_every = max(int(save_every or 0), 1)
 
     for idx, code in enumerate(codes, start=1):
@@ -687,6 +769,8 @@ def _ingest_daily_bars_incremental(
             failed_codes.append(code)
             if throttle is not None:
                 throttle.tick()
+            requests_made += 1
+            _proactive_relogin(bs, requests_made, relogin_every)
             continue
         normalized = normalize_daily_bars(raw_bars)
         fetched_daily.append(normalized)
@@ -694,6 +778,8 @@ def _ingest_daily_bars_incremental(
         print(f"[{idx}/{len(codes)}] {code} daily rows={len(normalized)}")
         if throttle is not None:
             throttle.tick()
+        requests_made += 1
+        _proactive_relogin(bs, requests_made, relogin_every)
         if successful_since_save >= flush_every:
             persisted = _merge_existing_daily(persisted, fetched_daily)
             storage.save_parquet(persisted, "daily_bars.parquet")

@@ -1,5 +1,6 @@
 import pandas as pd
 
+import scripts.ingest_baostock as ingest
 from scripts.ingest_baostock import (
     Throttle,
     _ingest_daily_bars_incremental,
@@ -7,6 +8,8 @@ from scripts.ingest_baostock import (
     _fetch_sector_map,
     _fetch_stock_basic,
     _login_with_retry,
+    _looks_like_connection_error,
+    _query_result,
     baostock_to_standard_code,
     build_arg_parser,
     build_sector_daily,
@@ -16,6 +19,29 @@ from scripts.ingest_baostock import (
     standard_to_baostock_code,
 )
 from astock_quant.data.storage import StorageManager
+
+
+class _RS:
+    """Minimal baostock result-set stand-in."""
+
+    def __init__(self, rows, fields, error_code="0", error_msg="success"):
+        self._rows = list(rows)
+        self.fields = list(fields)
+        self.error_code = error_code
+        self.error_msg = error_msg
+        self._index = -1
+
+    def next(self):
+        self._index += 1
+        return self._index < len(self._rows)
+
+    def get_row_data(self):
+        return self._rows[self._index]
+
+
+class _FakeLogin:
+    error_code = "0"
+    error_msg = "success"
 
 
 def test_baostock_code_conversion_round_trips():
@@ -406,6 +432,7 @@ def test_build_arg_parser_has_timeout_and_save_every_defaults():
     assert args.batch_size == 0
     assert args.batch_rest == 0.0
     assert args.jitter == 0.2
+    assert args.relogin_every == 0
 
 
 def test_build_arg_parser_parses_throttle_flags():
@@ -456,6 +483,86 @@ def test_throttle_jitter_stays_within_bounds():
     throttle.tick()
 
     assert slept == [1.2]
+
+
+def test_looks_like_connection_error_matches_baostock_receive_errors():
+    assert _looks_like_connection_error("daily sz.002491 failed: 10002007 网络接收错误")
+    assert _looks_like_connection_error("[WinError 10054] 远程主机强迫关闭了一个现有的连接")
+    assert _looks_like_connection_error("ConnectionResetError: connection reset by peer")
+    # A genuine business error (bad params, not a dropped socket) must not trigger relogin.
+    assert not _looks_like_connection_error("query failed: 10004003 invalid date range")
+
+
+def test_query_result_relogins_on_connection_error_then_succeeds(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda *_: None)
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+            self.logout_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return _FakeLogin()
+
+        def logout(self):
+            self.logout_calls += 1
+
+    bs = FakeBaostock()
+    attempts = {"n": 0}
+
+    def factory(**kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return _RS([], ["code"], error_code="10002007", error_msg="网络接收错误")
+        return _RS([["600000.SH"]], ["code"])
+
+    result = _query_result(factory, "daily test", retries=3, bs=bs, code="sh.600000")
+
+    assert attempts["n"] == 2  # failed once, retried after relogin, then succeeded
+    assert bs.logout_calls == 1
+    assert bs.login_calls == 1
+    assert result["code"].tolist() == ["600000.SH"]
+
+
+def test_query_result_does_not_relogin_on_business_error(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda *_: None)
+
+    class FakeBaostock:
+        def __init__(self):
+            self.login_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return _FakeLogin()
+
+        def logout(self):
+            pass
+
+    bs = FakeBaostock()
+
+    def factory(**kwargs):
+        return _RS([], ["code"], error_code="10004003", error_msg="invalid params")
+
+    try:
+        _query_result(factory, "daily test", retries=2, bs=bs, code="sh.600000")
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected RuntimeError after retries")
+
+    assert bs.login_calls == 0  # business errors must not trigger a re-login
+
+
+def test_proactive_relogin_fires_on_interval(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda *_: None)
+    relogins = []
+    monkeypatch.setattr(ingest, "_relogin", lambda bs, **kw: relogins.append(True))
+
+    for processed in range(1, 7):
+        ingest._proactive_relogin(object(), processed, relogin_every=3)
+
+    assert len(relogins) == 2  # fired at 3 and 6
 
 
 def test_fetch_stock_basic_ticks_throttle_per_code():

@@ -102,8 +102,14 @@ python -c "import pandas as pd; df=pd.read_parquet('data/processed/daily_bars.pa
 建议的过夜命令(慢而稳,从 2022 年起覆盖完整熊市与两次风格切换):
 
 ```powershell
-python scripts\ingest_baostock.py --start 2022-01-01 --end 2026-06-30 --sleep 0.6 --batch-size 200 --batch-rest 60
+python scripts\ingest_baostock.py --start 2022-01-01 --end 2026-06-30 --sleep 0.6 --batch-size 200 --batch-rest 60 --relogin-every 500
 ```
+
+**关于掉线自动重连(重要):** baostock 不是 HTTP 接口,而是一条 `bs.login()` 建立的 TCP 长连接。长时间全市场拉取时这条连接会被服务器/网络掐断,表现为 `WinError 10054 远程主机强迫关闭连接` 或 `10002007 网络接收错误`,而且会**连续多只票一起失败**——这是会话失活,不是逐请求限流,也和 User-Agent / `requests` 无关(baostock 走私有 socket 协议,没有 HTTP 头可改)。脚本已内置应对:
+
+- **掉线自动重连**:查询遇到连接类错误时,会先 `logout` + `login` 重建会话再重试,而不是在死连接上空重试。
+- **主动定期重连**:`--relogin-every N` 每拉 N 只票主动刷新一次会话,在它失活前就换新连接(预防为主)。
+- 真的某些票反复失败,会被记入末尾失败汇总并跳过,不影响整体。
 
 **断点续传已内置**:中途断了、被限了、或电脑睡眠了,直接**重跑同一条命令**即可——已拉全的票会自动跳过(`skip ... existing coverage`),`--save-every`(默认 50)会定期落盘,不会白拉。跑完看末尾打印的 `daily_bars rows=...` 和失败汇总。
 
