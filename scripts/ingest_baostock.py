@@ -621,20 +621,32 @@ def _enumerate_stock_codes(
     start_date: str | None,
     end_date: str,
     include_delisted: bool,
+    today: pd.Timestamp | None = None,
 ) -> list[str]:
-    dates = [end_date]
+    # baostock has no data for future dates, so never enumerate past today: a
+    # future --end (or current-year year-end) would otherwise return empty rows
+    # and crash the whole run before any stock is fetched.
+    today_ts = (today if today is not None else pd.Timestamp.today()).normalize()
+    end_ts = min(pd.Timestamp(end_date).normalize(), today_ts)
+    dates = [end_ts.strftime("%Y-%m-%d")]
     if include_delisted and start_date:
-        start_year = pd.Timestamp(start_date).year
-        end_ts = pd.Timestamp(end_date)
-        for year in range(start_year, end_ts.year + 1):
-            year_end = pd.Timestamp(year=year, month=12, day=31)
-            if pd.Timestamp(start_date) <= year_end <= end_ts:
+        start_ts = pd.Timestamp(start_date).normalize()
+        for year in range(start_ts.year, end_ts.year + 1):
+            year_end = min(pd.Timestamp(year=year, month=12, day=31), today_ts)
+            if start_ts <= year_end <= end_ts:
                 dates.append(year_end.strftime("%Y-%m-%d"))
+    dates = list(dict.fromkeys(dates))
 
     codes: list[str] = []
-    seen = set()
+    seen: set[str] = set()
     for query_date in dates:
-        frame = _query_all_stock_with_fallback(bs, query_date)
+        # One bad enumeration date (holiday gap, transient failure) must not kill
+        # the run as long as another date yields the universe.
+        try:
+            frame = _query_all_stock_with_fallback(bs, query_date, today=today_ts)
+        except RuntimeError as exc:
+            print(f"WARNING enumerate: no data near {query_date}, skipping: {exc}")
+            continue
         if frame.empty or "code" not in frame.columns:
             continue
         for code in frame["code"].dropna().astype(str):
@@ -643,11 +655,20 @@ def _enumerate_stock_codes(
                 continue
             seen.add(code)
             codes.append(code)
+    if not codes:
+        raise RuntimeError(
+            f"query_all_stock returned no codes for any of {dates}; "
+            "check that --end is a past trading day and baostock is reachable"
+        )
     return codes
 
 
-def _query_all_stock_with_fallback(bs: Any, day: str, max_backtrack_days: int = 14) -> pd.DataFrame:
-    current = pd.Timestamp(day)
+def _query_all_stock_with_fallback(
+    bs: Any, day: str, max_backtrack_days: int = 20, today: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    today_ts = (today if today is not None else pd.Timestamp.today()).normalize()
+    # Start the backtrack from today at the latest; a future day has no data.
+    current = min(pd.Timestamp(day).normalize(), today_ts)
     last_error: RuntimeError | None = None
     for offset in range(max_backtrack_days + 1):
         query_day = (current - pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
@@ -657,7 +678,7 @@ def _query_all_stock_with_fallback(bs: Any, day: str, max_backtrack_days: int = 
             last_error = exc
             continue
         if not frame.empty:
-            if offset > 0:
+            if query_day != pd.Timestamp(day).normalize().strftime("%Y-%m-%d"):
                 print(f"query_all_stock fallback {day} -> {query_day}")
             return frame
     raise RuntimeError(f"query_all_stock found no data near {day}") from last_error

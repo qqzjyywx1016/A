@@ -99,10 +99,10 @@ python -c "import pandas as pd; df=pd.read_parquet('data/processed/daily_bars.pa
 - `--batch-size` + `--batch-rest`:每拉 N 只就长休一次(如每 200 只休 60 秒),即"拉一会休息一会"。
 - `--jitter`:把每次停顿随机抖动 ±该比例(默认 0.2),让节奏不固定。
 
-建议的过夜命令(慢而稳,从 2022 年起覆盖完整熊市与两次风格切换):
+建议的过夜命令(慢而稳,从 2022 年起覆盖完整熊市与两次风格切换)。**`--end` 必须是已收盘的过去交易日,不要填未来日期**(填未来 baostock 没数据,脚本会自动钳制到今天,但直接填对更省事):
 
 ```powershell
-python scripts\ingest_baostock.py --start 2022-01-01 --end 2026-06-30 --sleep 0.6 --batch-size 200 --batch-rest 60 --relogin-every 500
+python scripts\ingest_baostock.py --start 2022-01-01 --end 2026-06-12 --sleep 0.6 --batch-size 200 --batch-rest 60 --relogin-every 500
 ```
 
 **关于掉线自动重连(重要):** baostock 不是 HTTP 接口,而是一条 `bs.login()` 建立的 TCP 长连接。长时间全市场拉取时这条连接会被服务器/网络掐断,表现为 `WinError 10054 远程主机强迫关闭连接` 或 `10002007 网络接收错误`,而且会**连续多只票一起失败**——这是会话失活,不是逐请求限流,也和 User-Agent / `requests` 无关(baostock 走私有 socket 协议,没有 HTTP 头可改)。脚本已内置应对:
@@ -116,7 +116,7 @@ python scripts\ingest_baostock.py --start 2022-01-01 --end 2026-06-30 --sleep 0.
 ### 7. 数据质检准入门槛
 
 ```powershell
-python scripts\validate_real_data.py --start 2022-01-01 --end 2026-06-30
+python scripts\validate_real_data.py --start 2022-01-01 --end 2026-06-12
 ```
 打印 `OK: data validation passed hard gates` 才允许进入后续回测;`BLOCKED` 则按提示修数据。(小样本验证仍用对应的小区间日期。)
 

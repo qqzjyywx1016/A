@@ -329,6 +329,63 @@ def test_enumerate_stock_codes_excludes_index_codes():
     ]
 
 
+def test_enumerate_stock_codes_clamps_future_end_date_to_today():
+    """A future --end must be clamped to today, not crash on empty future rows."""
+
+    class FakeBaostock:
+        def __init__(self):
+            self.queried_days = []
+
+        def query_all_stock(self, day=None):
+            self.queried_days.append(day)
+            if pd.Timestamp(day) > pd.Timestamp("2026-06-15"):
+                return FakeResultSet(["code", "tradeStatus"], [])
+            return FakeResultSet(["code", "tradeStatus"], [["sh.600000", "1"], ["sz.000001", "1"]])
+
+    fake = FakeBaostock()
+    codes = _enumerate_stock_codes(
+        fake, None, "2026-06-30", include_delisted=False, today=pd.Timestamp("2026-06-15")
+    )
+
+    assert codes == ["sh.600000", "sz.000001"]
+    assert all(pd.Timestamp(day) <= pd.Timestamp("2026-06-15") for day in fake.queried_days)
+
+
+def test_enumerate_stock_codes_tolerates_a_dead_date_and_uses_another():
+    """If one enumeration date yields nothing, another date still seeds the universe."""
+
+    class FakeBaostock:
+        def query_all_stock(self, day=None):
+            if pd.Timestamp(day).year >= 2026:
+                return FakeResultSet(["code", "tradeStatus"], [])
+            return FakeResultSet(["code", "tradeStatus"], [["sh.600000", "1"]])
+
+    codes = _enumerate_stock_codes(
+        FakeBaostock(),
+        "2025-01-01",
+        "2026-06-30",
+        include_delisted=True,
+        today=pd.Timestamp("2026-06-15"),
+    )
+
+    assert codes == ["sh.600000"]
+
+
+def test_enumerate_stock_codes_raises_when_every_date_is_empty():
+    class FakeBaostock:
+        def query_all_stock(self, day=None):
+            return FakeResultSet(["code", "tradeStatus"], [])
+
+    try:
+        _enumerate_stock_codes(
+            FakeBaostock(), None, "2026-06-12", include_delisted=False, today=pd.Timestamp("2026-06-15")
+        )
+    except RuntimeError as exc:
+        assert "no codes" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected RuntimeError when all enumeration dates are empty")
+
+
 def test_fetch_stock_basic_applies_limit_after_true_stock_filtering():
     class FakeBaostock:
         def __init__(self):
