@@ -8,6 +8,7 @@ for post-trade evaluation and are never fed back into the signal path.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -54,8 +55,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _quiet_warmup_logs() -> None:
+    """Silence the expected per-date warmup/structural warnings during the IC sweep.
+
+    Early dates lack enough history for RPS, and market_cap/fund_flow/pattern/
+    sentiment are not part of the five scored factors, so these loggers would
+    otherwise emit thousands of expected WARNINGs and bury the progress output.
+    """
+
+    for name in (
+        "astock_quant.features.momentum",
+        "astock_quant.features.sector",
+        "astock_quant.scoring.score_engine",
+    ):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 def main() -> None:
     args = build_arg_parser().parse_args()
+    _quiet_warmup_logs()
 
     config = load_config()
     storage = StorageManager(config)
@@ -91,10 +109,14 @@ def main() -> None:
         for date in daily_bars["trade_date"].drop_duplicates()
         if pd.Timestamp(args.start).normalize() <= date <= pd.Timestamp(args.end).normalize()
     )
-    for trade_date in dates:
+    total_dates = len(dates)
+    print(f"scoring {total_dates} trading days from {args.start} to {args.end} (this can take a while)...", flush=True)
+    for index, trade_date in enumerate(dates, start=1):
         trade_date_str = pd.Timestamp(trade_date).date().isoformat()
         bars_slice = daily_bars[daily_bars["trade_date"] <= trade_date].copy()
         latest = bars_slice[bars_slice["trade_date"] == trade_date].copy()
+        if index % 20 == 0 or index == total_dates:
+            print(f"[{index}/{total_dates}] scored through {trade_date_str}", flush=True)
         if latest.empty:
             continue
         if not stock_basic.empty:

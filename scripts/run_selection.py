@@ -238,14 +238,62 @@ def slice_market_data(market_data: dict[str, pd.DataFrame], trade_date: str) -> 
     return sliced
 
 
+COMPACT_COLUMNS = [
+    ("stock_code", "代码"),
+    ("stock_name", "名称"),
+    ("active_sector_name", "板块"),
+    ("total_score", "评分"),
+    ("rating", "评级"),
+    ("rps_20", "RPS20"),
+    ("sector_rps_composite", "板块RPS"),
+    ("suggestion", "计划"),
+]
+
+
+def compact_selection(selected: pd.DataFrame) -> pd.DataFrame:
+    """Return a readable subset of the selection for terminal display."""
+
+    view = pd.DataFrame(index=selected.index)
+    for source, label in COMPACT_COLUMNS:
+        if source == "active_sector_name" and source not in selected.columns:
+            source = "sector"
+        if source not in selected.columns:
+            view[label] = ""
+            continue
+        column = selected[source]
+        if source in {"total_score"}:
+            view[label] = pd.to_numeric(column, errors="coerce").round(1)
+        elif source in {"rps_20", "sector_rps_composite"}:
+            view[label] = pd.to_numeric(column, errors="coerce").round(0)
+        elif label == "板块":
+            view[label] = column.astype(str).str.slice(0, 12)
+        else:
+            view[label] = column
+    return view
+
+
 def main() -> None:
     """CLI entry point."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", required=True, help="Signal date, for example 2026-06-04")
+    parser.add_argument("--date", required=True, help="Signal date, for example 2026-06-12")
+    parser.add_argument("--full", action="store_true", help="Print every column instead of the compact view")
     args = parser.parse_args()
     result = run_selection(args.date)
-    print(result.to_string(index=False) if not result.empty else "No candidates.")
+    if result.empty:
+        print("No candidates.")
+        return
+
+    csv_path = StorageManager(load_config()).result_path / f"{args.date}_selection.csv"
+    core_count = int((result["rating"] == "A").sum()) if "rating" in result.columns else 0
+    print(f"\n候选 {len(result)} 只 (A 级核心 {core_count} 只) — 完整字段见 {csv_path}\n")
+    if args.full:
+        print(result.to_string(index=False))
+        return
+    # east_asian_width aligns the Chinese stock and sector names in the terminal.
+    pd.set_option("display.unicode.east_asian_width", True)
+    pd.set_option("display.width", 200)
+    print(compact_selection(result).to_string(index=False))
 
 
 if __name__ == "__main__":

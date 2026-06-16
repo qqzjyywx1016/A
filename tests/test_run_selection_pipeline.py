@@ -2,6 +2,7 @@ import pandas as pd
 
 from scripts.run_batch_signals import build_backtest_panel
 import scripts.run_selection as run_selection_module
+from scripts.run_selection import compact_selection
 
 
 class _FactorStub:
@@ -198,6 +199,38 @@ def test_run_selection_returns_empty_for_non_trading_day(caplog):
     assert result["selected"].empty
     assert any("no market data for trade_date=2026-06-14" in record.message for record in caplog.records)
     assert any("2026-06-12" in record.message for record in caplog.records)
+
+
+def test_compact_selection_picks_key_columns_and_truncates_sector():
+    selected = pd.DataFrame(
+        [
+            {
+                "stock_code": "603608.SH",
+                "stock_name": "天创时尚",
+                "active_sector_name": "C19皮革、毛皮、羽毛及其制品和制鞋业",
+                "total_score": 77.866,
+                "rating": "B",
+                "rps_20": 99.826,
+                "sector_rps_composite": 96.81,
+                "suggestion": "pullback_buy_plan",
+            }
+        ]
+    )
+
+    view = compact_selection(selected)
+
+    assert list(view.columns) == ["代码", "名称", "板块", "评分", "评级", "RPS20", "板块RPS", "计划"]
+    assert view.iloc[0]["评分"] == 77.9
+    assert view.iloc[0]["RPS20"] == 100.0
+    assert len(view.iloc[0]["板块"]) <= 12
+
+
+def test_compact_selection_is_graceful_when_columns_missing():
+    view = compact_selection(pd.DataFrame([{"stock_code": "600000.SH", "total_score": 70.0, "rating": "B"}]))
+
+    assert view.iloc[0]["代码"] == "600000.SH"
+    assert view.iloc[0]["板块"] == ""
+    assert view.iloc[0]["计划"] == ""
 
 
 def test_build_backtest_panel_includes_continue_hold_columns():
