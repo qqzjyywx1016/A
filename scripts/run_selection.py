@@ -31,6 +31,9 @@ from astock_quant.strategy.overheat_filter import OverheatFilter
 from astock_quant.strategy.position import PositionSizer
 from astock_quant.strategy.selector import StockSelector
 from astock_quant.universe.filters import UniverseFilter
+from astock_quant.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def selection_config(config: dict) -> dict:
@@ -90,6 +93,23 @@ def run_selection(
 
     daily_bars = enrich_daily_bars_for_selection(daily_bars)
     latest = daily_bars[pd.to_datetime(daily_bars["trade_date"]).dt.normalize() == pd.Timestamp(trade_date).normalize()].copy()
+    if latest.empty:
+        # The signal date has no bars (weekend/holiday or beyond ingested range):
+        # bail out with a clear message instead of a wall of neutral-factor warnings.
+        available = pd.to_datetime(daily_bars["trade_date"]).dt.normalize()
+        last_available = available.max()
+        hint = last_available.date().isoformat() if pd.notna(last_available) else "unknown"
+        logger.warning(
+            "no market data for trade_date=%s (not a trading day, or beyond ingested range); "
+            "last available trading day in data is %s. Re-run with --date %s",
+            trade_date,
+            hint,
+            hint,
+        )
+        empty = pd.DataFrame()
+        if save:
+            storage.save_daily_selection(empty, trade_date)
+        return {"selected": empty, "rejected": pd.DataFrame(), "scored": empty} if return_details else empty
     if not stock_basic.empty:
         latest = latest.merge(stock_basic, on="stock_code", how="left", suffixes=("", "_basic"))
         for column in ["stock_name", "sector"]:

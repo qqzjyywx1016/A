@@ -169,6 +169,37 @@ def test_run_selection_uses_in_memory_market_data_and_slices_future_rows(monkeyp
     assert selected["stock_code"].tolist() == [stock_code]
 
 
+def test_run_selection_returns_empty_for_non_trading_day(caplog):
+    # Data only covers 2026-06-12 (Fri); ask for 2026-06-14 (Sun) -> clear bail-out.
+    market_data = {
+        "stock_basic": pd.DataFrame([{"stock_code": "600001.SH", "stock_name": "x", "sector": "s"}]),
+        "daily_bars": pd.DataFrame(
+            [{"stock_code": "600001.SH", "trade_date": "2026-06-12", "open": 10, "high": 10.5, "low": 9.8, "close": 10.4, "turnover_amount": 3e8}]
+        ),
+        "sector_map": pd.DataFrame(),
+        "sector_daily": pd.DataFrame(),
+        "fund_flow": pd.DataFrame(),
+        "index_bars": pd.DataFrame(),
+        "limit_status": pd.DataFrame(),
+    }
+    config = {
+        "data": {"result_path": "/tmp", "processed_path": "/tmp", "raw_path": "/tmp", "report_path": "/tmp"},
+        "universe": {},
+        "score_weights": {"momentum": 1.0},
+        "selection": {"min_total_score": 70},
+        "rps": {"enabled": False},
+    }
+
+    with caplog.at_level("WARNING"):
+        result = run_selection_module.run_selection(
+            "2026-06-14", config=config, save=False, market_data=market_data, return_details=True
+        )
+
+    assert result["selected"].empty
+    assert any("no market data for trade_date=2026-06-14" in record.message for record in caplog.records)
+    assert any("2026-06-12" in record.message for record in caplog.records)
+
+
 def test_build_backtest_panel_includes_continue_hold_columns():
     trade_date = "2026-06-04"
     bars = pd.DataFrame(
