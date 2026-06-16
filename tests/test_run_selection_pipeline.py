@@ -2,7 +2,8 @@ import pandas as pd
 
 from scripts.run_batch_signals import build_backtest_panel
 import scripts.run_selection as run_selection_module
-from scripts.run_selection import compact_selection
+from scripts.run_selection import attach_concept_tags, compact_selection
+from astock_quant.data.storage import StorageManager
 
 
 class _FactorStub:
@@ -165,9 +166,48 @@ def test_run_selection_uses_in_memory_market_data_and_slices_future_rows(monkeyp
         },
     }
 
+    # A concept_map exists, but the batch/backtest path (market_data provided)
+    # must NOT attach current concept tags -- that would be look-ahead bias.
+    StorageManager(config).save_parquet(
+        pd.DataFrame([{"stock_code": stock_code, "top_concepts": "机器人,减速器", "concept_tags": "机器人,减速器", "top_concept": "机器人"}]),
+        "concept_map.parquet",
+    )
+
     selected = run_selection_module.run_selection(trade_date, config=config, save=False, market_data=market_data)
 
     assert selected["stock_code"].tolist() == [stock_code]
+    assert "top_concepts" not in selected.columns
+    assert "concept_tags" not in selected.columns
+
+
+def test_attach_concept_tags_merges_when_concept_map_present(tmp_path):
+    config = {"data": {"processed_path": str(tmp_path), "raw_path": str(tmp_path), "result_path": str(tmp_path), "report_path": str(tmp_path)}}
+    storage = StorageManager(config)
+    storage.save_parquet(
+        pd.DataFrame(
+            [
+                {"stock_code": "603608.SH", "top_concepts": "机器人,减速器", "concept_tags": "机器人,减速器,AI", "top_concept": "机器人"},
+            ]
+        ),
+        "concept_map.parquet",
+    )
+    selected = pd.DataFrame([{"stock_code": "603608.SH", "total_score": 77.9}, {"stock_code": "000001.SZ", "total_score": 70.0}])
+
+    merged = attach_concept_tags(selected, storage)
+
+    assert merged.loc[merged["stock_code"] == "603608.SH", "top_concepts"].iloc[0] == "机器人,减速器"
+    # Stocks without a concept entry get an empty string, not NaN.
+    assert merged.loc[merged["stock_code"] == "000001.SZ", "top_concepts"].iloc[0] == ""
+
+
+def test_attach_concept_tags_is_noop_without_concept_map(tmp_path):
+    config = {"data": {"processed_path": str(tmp_path), "raw_path": str(tmp_path), "result_path": str(tmp_path), "report_path": str(tmp_path)}}
+    selected = pd.DataFrame([{"stock_code": "603608.SH", "total_score": 77.9}])
+
+    merged = attach_concept_tags(selected, StorageManager(config))
+
+    assert "top_concepts" not in merged.columns
+    assert merged.equals(selected)
 
 
 def test_run_selection_returns_empty_for_non_trading_day(caplog):
@@ -219,7 +259,7 @@ def test_compact_selection_picks_key_columns_and_truncates_sector():
 
     view = compact_selection(selected)
 
-    assert list(view.columns) == ["代码", "名称", "板块", "评分", "评级", "RPS20", "板块RPS", "计划"]
+    assert list(view.columns) == ["代码", "名称", "板块", "概念", "评分", "评级", "RPS20", "板块RPS", "计划"]
     assert view.iloc[0]["评分"] == 77.9
     assert view.iloc[0]["RPS20"] == 100.0
     assert len(view.iloc[0]["板块"]) <= 12

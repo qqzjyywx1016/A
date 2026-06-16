@@ -179,13 +179,25 @@ python scripts/update_data.py
 
 批量拉全市场会触发大量 HTTP 请求，尤其是东财接口有风控。可在 `config/default.yaml` 的 `external.astock_codes` 或 `external.max_fetch_codes` 限制首次拉取范围。
 
+## 概念板块标签(可选,仅用于实盘展示)
+
+baostock 不提供概念板块,只有申万行业。`scripts/ingest_concepts.py` 从东财 slist 接口逐只票抓取**当前**所属概念,写入 `data/processed/concept_map.parquet`(字段 `top_concepts/concept_tags/...`)。需要东财在本机可连(先用 README 里那条 `slist` 测试命令验证)。
+
+```powershell
+python scripts\ingest_concepts.py --sleep 0.3 --batch-size 300 --batch-rest 30
+```
+
+与日线 ingest 一样支持断点续传(重跑跳过已抓的票)和限速;概念变化慢,偶尔重抓一次即可。`--codes` 可只抓指定票,`--top-n` 控制展示保留几个概念。
+
+**重要边界:概念标签是"当前"口径、无历史生效日,因此只在实盘选股(`run_selection`,即 `market_data is None` 的实时路径)中合并展示,绝不进入批量信号/回测路径**——否则拿今天的题材标签套到历史就是未来函数。这一隔离由代码强制保证,并有测试覆盖。
+
 ## 如何运行选股
 
 ```bash
-python scripts/run_selection.py --date 2026-06-04
+python scripts/run_selection.py --date 2026-06-12
 ```
 
-输出保存到 `data/results/YYYY-MM-DD_selection.csv`。
+终端默认打印紧凑表(代码/名称/板块/概念/评分/评级/RPS/计划),完整字段(买卖计划价位、各因子分等)保存到 `data/results/YYYY-MM-DD_selection.csv`;想在终端看全字段加 `--full`。`concept_map.parquet` 存在时,选股结果会带上 `top_concepts/concept_tags` 概念列。
 若启用 `overheat`，过热前置筛选剔除的股票会保存到 `data/results/YYYY-MM-DD_rejected.csv`，用于复盘。
 
 ## 如何运行回测

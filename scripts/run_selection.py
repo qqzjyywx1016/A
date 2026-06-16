@@ -173,12 +173,39 @@ def run_selection(
             latest[plan_fields].drop_duplicates("stock_code"), on="stock_code", how="left", suffixes=("", "_bar")
         )
     selected = BuyRuleEngine(config.get("buy_rules", {})).generate(selected)
+    # Concept tags are current-only (no point-in-time history), so they are
+    # attached on the LIVE path only. market_data is supplied exclusively by the
+    # batch/backtest caller, so gating on `market_data is None` guarantees the
+    # backtest never sees today's tags (which would be look-ahead bias).
+    if market_data is None and not selected.empty:
+        selected = attach_concept_tags(selected, storage)
     if save:
         storage.save_daily_selection(selected, trade_date)
         storage.save_rejected_candidates(rejected, trade_date)
     if return_details:
         return {"selected": selected, "rejected": rejected, "scored": scored}
     return selected
+
+
+def attach_concept_tags(selected: pd.DataFrame, storage: StorageManager) -> pd.DataFrame:
+    """Left-merge current Eastmoney concept tags for live display (no-op if absent)."""
+
+    path = storage.processed_path / "concept_map.parquet"
+    if not Path(path).exists():
+        return selected
+    try:
+        concept_map = pd.read_parquet(path)
+    except Exception as exc:  # a corrupt cache must not break selection
+        logger.warning("failed reading concept_map.parquet: %s", exc)
+        return selected
+    keep = [column for column in ["stock_code", "top_concepts", "concept_tags", "top_concept"] if column in concept_map.columns]
+    if "stock_code" not in keep or len(keep) <= 1:
+        return selected
+    merged = selected.merge(concept_map[keep].drop_duplicates("stock_code"), on="stock_code", how="left")
+    for column in keep:
+        if column != "stock_code" and column in merged.columns:
+            merged[column] = merged[column].fillna("")
+    return merged
 
 
 def enrich_daily_bars_for_selection(daily_bars: pd.DataFrame) -> pd.DataFrame:
@@ -242,6 +269,7 @@ COMPACT_COLUMNS = [
     ("stock_code", "代码"),
     ("stock_name", "名称"),
     ("active_sector_name", "板块"),
+    ("top_concepts", "概念"),
     ("total_score", "评分"),
     ("rating", "评级"),
     ("rps_20", "RPS20"),
@@ -267,6 +295,8 @@ def compact_selection(selected: pd.DataFrame) -> pd.DataFrame:
             view[label] = pd.to_numeric(column, errors="coerce").round(0)
         elif label == "板块":
             view[label] = column.astype(str).str.slice(0, 12)
+        elif label == "概念":
+            view[label] = column.astype(str).str.slice(0, 18)
         else:
             view[label] = column
     return view
