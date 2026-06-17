@@ -205,6 +205,13 @@ def attach_concept_tags(selected: pd.DataFrame, storage: StorageManager) -> pd.D
     for column in keep:
         if column != "stock_code" and column in merged.columns:
             merged[column] = merged[column].fillna("")
+    # Re-derive top_concepts from the fuller concept_tags using the current
+    # blacklist, so a concept_map built with an older/narrower filter is cleaned
+    # at display time without forcing a re-ingest.
+    if "concept_tags" in merged.columns:
+        from scripts.ingest_concepts import top_concepts_from_tags
+
+        merged["top_concepts"] = merged["concept_tags"].map(top_concepts_from_tags)
     return merged
 
 

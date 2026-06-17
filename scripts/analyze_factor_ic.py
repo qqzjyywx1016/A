@@ -13,6 +13,7 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -164,7 +165,11 @@ def main() -> None:
     panel = scored_all.merge(forward, on=["stock_code", "trade_date"], how="left")
     summary = _ic_summary(panel, horizons)
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
-    corr = scored_all[FACTOR_SCORE_COLUMNS].corr(method="spearman")
+    # Spearman == Pearson on ranks; ranking first keeps this scipy-free. Constant
+    # factors (e.g. all-neutral market_cap) divide by zero variance -> NaN; mute
+    # the expected numpy warning so it does not spam the multi-hour run.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = scored_all[FACTOR_SCORE_COLUMNS].rank().corr()
     _write_markdown(markdown_path, summary, corr, args.start, args.end, horizons)
     print(summary_path)
 
@@ -188,6 +193,13 @@ def _forward_returns(daily_bars: pd.DataFrame, horizons: list[int]) -> pd.DataFr
 
 def _ic_summary(panel: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
     rows = []
+    # Constant factors on a day have zero rank variance -> NaN IC; mute the
+    # expected numpy divide warning rather than spam it once per factor per day.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return _ic_summary_rows(panel, horizons, rows)
+
+
+def _ic_summary_rows(panel: pd.DataFrame, horizons: list[int], rows: list) -> pd.DataFrame:
     for horizon in horizons:
         target = f"forward_return_{horizon}d"
         for factor in FACTOR_SCORE_COLUMNS:
@@ -195,7 +207,8 @@ def _ic_summary(panel: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
                 panel[["trade_date", factor, target]]
                 .dropna()
                 .groupby("trade_date")
-                .apply(lambda df: df[factor].corr(df[target], method="spearman"), include_groups=False)
+                # Rank IC == Pearson on per-day ranks; avoids the scipy dependency.
+                .apply(lambda df: df[factor].rank().corr(df[target].rank()), include_groups=False)
                 .dropna()
             )
             observations = int(daily_ic.count())

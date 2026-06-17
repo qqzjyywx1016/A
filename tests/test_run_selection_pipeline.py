@@ -183,10 +183,11 @@ def test_run_selection_uses_in_memory_market_data_and_slices_future_rows(monkeyp
 def test_attach_concept_tags_merges_when_concept_map_present(tmp_path):
     config = {"data": {"processed_path": str(tmp_path), "raw_path": str(tmp_path), "result_path": str(tmp_path), "report_path": str(tmp_path)}}
     storage = StorageManager(config)
+    # concept_tags carries junk (历史新高) that must be cleaned at display time.
     storage.save_parquet(
         pd.DataFrame(
             [
-                {"stock_code": "603608.SH", "top_concepts": "机器人,减速器", "concept_tags": "机器人,减速器,AI", "top_concept": "机器人"},
+                {"stock_code": "603608.SH", "top_concepts": "历史新高,机器人", "concept_tags": "历史新高,机器人,减速器", "top_concept": "历史新高"},
             ]
         ),
         "concept_map.parquet",
@@ -195,6 +196,7 @@ def test_attach_concept_tags_merges_when_concept_map_present(tmp_path):
 
     merged = attach_concept_tags(selected, storage)
 
+    # top_concepts is re-derived from concept_tags with the current blacklist (历史新高 dropped).
     assert merged.loc[merged["stock_code"] == "603608.SH", "top_concepts"].iloc[0] == "机器人,减速器"
     # Stocks without a concept entry get an empty string, not NaN.
     assert merged.loc[merged["stock_code"] == "000001.SZ", "top_concepts"].iloc[0] == ""

@@ -31,23 +31,24 @@ from scripts.ingest_baostock import Throttle
 CONCEPT_MAP_FILE = "concept_map.parquet"
 CONCEPT_MAP_COLUMNS = ["stock_code", "concept_tags", "top_concepts", "top_concept", "concept_count", "fetch_date"]
 
-# Eastmoney slist returns industry/region/trading-status blocks alongside real
-# concepts; drop the obvious non-theme ones so the display shows actual themes.
+# Eastmoney slist returns technical-pattern, index-membership, size, holdings and
+# region blocks alongside real themes. Strong momentum names are *all* tagged
+# "历史新高/趋势股" etc., so those carry no signal and bury the actual concepts.
+# Drop them by substring so only tradable themes remain.
 NON_CONCEPT_HINTS = (
-    "融资融券",
-    "沪股通",
-    "深股通",
-    "转融券",
-    "标普",
-    "MSCI",
-    "富时",
-    "AB股",
-    "AH股",
-    "GDR",
-    "新股",
-    "次新股",
-    "ST板块",
-    "板块",  # generic "xx板块" region labels like 深圳板块/上海板块
+    # financing / cross-border / index membership
+    "融资融券", "沪股通", "深股通", "转融券", "转债", "标的",
+    "标普", "MSCI", "富时", "AB股", "AH股", "GDR", "新股", "次新", "注册制",
+    "上证50", "上证180", "上证380", "沪深300", "中证500", "中证1000", "中证100",
+    "深成500", "深证成指", "创业板综", "创业板50", "科创50", "成份股", "成分股",
+    # technical patterns / hot lists (every strong stock matches these)
+    "新高", "新低", "趋势股", "振幅", "涨停", "连板", "跌停", "连续上涨", "连续下跌",
+    "热股", "人气", "题材股", "百元股", "破净",
+    # holdings / size / financial events
+    "重仓", "盘股", "高送转", "送转", "预增", "预减", "预盈", "预亏",
+    "回购", "增持", "减持", "解禁", "高股息",
+    # region buckets
+    "板块", "特区", "本地", "大开发",
 )
 
 
@@ -56,6 +57,18 @@ def _is_concept(name: str) -> bool:
     if not text:
         return False
     return not any(hint in text for hint in NON_CONCEPT_HINTS)
+
+
+def top_concepts_from_tags(concept_tags: object, top_n: int = 3) -> str:
+    """Re-derive the top concepts from a stored concept_tags string.
+
+    Used at display time so an older concept_map (built with a narrower blacklist)
+    is cleaned without re-ingesting; the stored tags are already hottest-first.
+    """
+
+    names = [name.strip() for name in str(concept_tags or "").split(",") if name.strip()]
+    clean = [name for name in names if _is_concept(name)]
+    return ",".join(clean[:top_n])
 
 
 def build_concept_row(stock_code: str, blocks: list[dict], top_n: int) -> dict:
