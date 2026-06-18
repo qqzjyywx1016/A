@@ -230,6 +230,24 @@ def _ic_summary_rows(panel: pd.DataFrame, horizons: list[int], rows: list) -> pd
     return pd.DataFrame(rows)
 
 
+def _df_to_markdown(df: pd.DataFrame) -> str:
+    """Render a DataFrame as a GitHub-flavored markdown table without tabulate."""
+
+    headers = [str(column) for column in df.columns]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
+    for _, row in df.iterrows():
+        cells = []
+        for value in row:
+            if value is None or (pd.api.types.is_scalar(value) and pd.isna(value)):
+                cells.append("")
+            elif isinstance(value, float):
+                cells.append(f"{value:.6g}")
+            else:
+                cells.append(str(value))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def _write_markdown(
     path: Path,
     summary: pd.DataFrame,
@@ -238,6 +256,9 @@ def _write_markdown(
     end: str,
     horizons: list[int],
 ) -> None:
+    corr_table = (
+        _df_to_markdown(corr.round(4).rename_axis("factor").reset_index()) if not corr.empty else "No correlation matrix."
+    )
     lines = [
         "# Factor IC Report",
         "",
@@ -247,11 +268,11 @@ def _write_markdown(
         "",
         "## IC Summary",
         "",
-        summary.to_markdown(index=False) if not summary.empty else "No IC rows.",
+        _df_to_markdown(summary) if not summary.empty else "No IC rows.",
         "",
         "## Factor Score Spearman Correlation",
         "",
-        corr.round(4).to_markdown() if not corr.empty else "No correlation matrix.",
+        corr_table,
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")

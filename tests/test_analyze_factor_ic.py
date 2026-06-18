@@ -1,6 +1,6 @@
 import pandas as pd
 
-from scripts.analyze_factor_ic import FACTOR_SCORE_COLUMNS, _ic_summary, build_arg_parser
+from scripts.analyze_factor_ic import FACTOR_SCORE_COLUMNS, _df_to_markdown, _ic_summary, _write_markdown, build_arg_parser
 
 
 def test_analyze_factor_ic_accepts_space_separated_horizons():
@@ -46,3 +46,27 @@ def test_ic_summary_detects_negative_rank_ic():
     momentum = summary[summary["factor"] == "momentum_score"].iloc[0]
 
     assert momentum["ic_mean"] == -1.0
+
+
+def test_df_to_markdown_is_tabulate_free_pipe_table():
+    df = pd.DataFrame([{"factor": "momentum_score", "ic_mean": 0.0123, "observations": 2, "ic_ir": pd.NA}])
+
+    table = _df_to_markdown(df)
+    lines = table.splitlines()
+
+    assert lines[0] == "| factor | ic_mean | observations | ic_ir |"
+    assert lines[1] == "| --- | --- | --- | --- |"
+    assert lines[2] == "| momentum_score | 0.0123 | 2 |  |"  # NA renders blank
+
+
+def test_write_markdown_renders_without_tabulate(tmp_path):
+    summary = _ic_summary(_ic_panel([1, 2, 3, 4, 5], [0.01, 0.02, 0.03, 0.04, 0.05]), [1])
+    corr = pd.DataFrame([[1.0, 0.5], [0.5, 1.0]], index=["momentum_score", "volume_score"], columns=["momentum_score", "volume_score"])
+    path = tmp_path / "factor_ic_report.md"
+
+    _write_markdown(path, summary, corr, "2025-06-01", "2026-06-12", [1])
+    text = path.read_text(encoding="utf-8")
+
+    assert "# Factor IC Report" in text
+    assert "| factor | momentum_score | volume_score |" in text  # corr corner labeled
+    assert "momentum_score" in text
