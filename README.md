@@ -120,6 +120,19 @@ python scripts\validate_real_data.py --start 2022-01-01 --end 2026-06-12
 ```
 打印 `OK: data validation passed hard gates` 才允许进入后续回测;`BLOCKED` 则按提示修数据。(小样本验证仍用对应的小区间日期。)
 
+### 8. 每日增量更新并选股(自动识别日期)
+
+数据落后了几天,不用手算日期。`scripts/daily_update.py` 会读 `daily_bars.parquet` 的最新日期,自动补到今天(非交易日 baostock 返回空,脚本已钳制),刷新指数与板块日线,再对最新交易日跑一次选股:
+
+```powershell
+python scripts\daily_update.py --sleep 0.3 --batch-size 300 --batch-rest 30
+```
+
+- **默认增量**:只重抓最近 `--lookback-days`(默认 90 天)并覆盖。这是为前复权(qfq)而设——baostock 的 qfq 以"最新一天"为基准,补的窗口里若有除权除息会让整条历史价位平移,所以重抓最近一段覆盖,保证因子用到的回看窗(≤60 交易日)在同一基准上、不出现接缝。
+- **`--full`**:从头重抓全历史(回测级一致性,慢)。**做正式全周期回测前先跑一次 `--full`**,因为长期反复增量会让深层历史残留旧基准接缝。
+- `--no-run` 只补数据不选股。断点续传/限速/掉线重连与全市场 ingest 一致。
+- 新上市股票要靠 `--full` 重新枚举才会纳入(增量模式只更新已跟踪的票)。
+
 ### 常见问题
 
 - **激活报“无法加载文件 Activate.ps1,因为在此系统上禁止运行脚本”**:执行 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` 后重试,或改用 `activate.bat`。
