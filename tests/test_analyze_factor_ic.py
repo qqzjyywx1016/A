@@ -1,6 +1,13 @@
 import pandas as pd
 
-from scripts.analyze_factor_ic import FACTOR_SCORE_COLUMNS, _df_to_markdown, _ic_summary, _write_markdown, build_arg_parser
+from scripts.analyze_factor_ic import (
+    FACTOR_SCORE_COLUMNS,
+    _df_to_markdown,
+    _ic_summary,
+    _ic_summary_by,
+    _write_markdown,
+    build_arg_parser,
+)
 
 
 def test_analyze_factor_ic_accepts_space_separated_horizons():
@@ -46,6 +53,29 @@ def test_ic_summary_detects_negative_rank_ic():
     momentum = summary[summary["factor"] == "momentum_score"].iloc[0]
 
     assert momentum["ic_mean"] == -1.0
+
+
+def test_ic_summary_by_segments_splits_signal_by_bucket():
+    # momentum positive in 2023 (trending), negative in 2024 (reversal) -> regime-dependent.
+    rows = []
+    for day, fwd in [("2023-01-03", [0.01, 0.02, 0.03, 0.04, 0.05]), ("2024-01-03", [0.05, 0.04, 0.03, 0.02, 0.01])]:
+        for i, (factor, ret) in enumerate(zip([1, 2, 3, 4, 5], fwd, strict=True)):
+            row = {"stock_code": f"{i:06d}.SZ", "trade_date": day, "forward_return_1d": ret}
+            for column in FACTOR_SCORE_COLUMNS:
+                row[column] = 50.0
+            row["momentum_score"] = factor
+            rows.append(row)
+    panel = pd.DataFrame(rows)
+    panel["trade_date"] = pd.to_datetime(panel["trade_date"])
+    panel["year"] = panel["trade_date"].dt.year.astype(str)
+
+    by_year = _ic_summary_by(panel, [1], "year")
+    m2023 = by_year[(by_year["segment"] == "2023") & (by_year["factor"] == "momentum_score")].iloc[0]
+    m2024 = by_year[(by_year["segment"] == "2024") & (by_year["factor"] == "momentum_score")].iloc[0]
+
+    assert m2023["ic_mean"] == 1.0
+    assert m2024["ic_mean"] == -1.0
+    assert set(by_year["segment"]) == {"2023", "2024"}
 
 
 def test_df_to_markdown_is_tabulate_free_pipe_table():

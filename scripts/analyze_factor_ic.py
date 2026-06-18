@@ -27,6 +27,7 @@ from astock_quant.features.market_cap import MarketCapFactor
 from astock_quant.features.momentum import MomentumFactor
 from astock_quant.features.reversal import ReversalFactor
 from astock_quant.features.sector import SectorFactor
+from astock_quant.features.sentiment import SentimentFactor
 from astock_quant.features.volume import VolumeFactor
 from astock_quant.scoring.score_engine import ScoreEngine
 from scripts.run_selection import build_market_cap_snapshot, enrich_daily_bars_for_selection, sector_factor_config
@@ -111,6 +112,7 @@ def main() -> None:
         if pd.Timestamp(args.start).normalize() <= date <= pd.Timestamp(args.end).normalize()
     )
     total_dates = len(dates)
+    regime_by_date: dict[pd.Timestamp, str] = {}
     print(f"scoring {total_dates} trading days from {args.start} to {args.end} (this can take a while)...", flush=True)
     for index, trade_date in enumerate(dates, start=1):
         trade_date_str = pd.Timestamp(trade_date).date().isoformat()
@@ -124,6 +126,14 @@ def main() -> None:
             latest = latest.merge(stock_basic, on="stock_code", how="left", suffixes=("", "_basic"))
         sector_slice = _slice_by_date(sector_daily, trade_date)
         index_slice = _slice_by_date(index_bars, trade_date)
+        # Per-date market regime (history-only, no lookahead) so IC can be split
+        # by regime -- the key question is whether momentum only works in某些 regimes.
+        sentiment = SentimentFactor(config.get("sentiment", {})).calculate(
+            bars_slice, trade_date=trade_date_str, index_bars=index_slice
+        )
+        regime_by_date[trade_date] = (
+            str(sentiment["market_regime"].iloc[0]) if not sentiment.empty and "market_regime" in sentiment.columns else "unknown"
+        )
         sector_factor = SectorFactor(sector_factor_config(config)).calculate(
             bars_slice,
             trade_date=trade_date_str,
@@ -163,14 +173,21 @@ def main() -> None:
     scored_all["trade_date"] = pd.to_datetime(scored_all["trade_date"]).dt.normalize()
     forward = _forward_returns(daily_bars, horizons)
     panel = scored_all.merge(forward, on=["stock_code", "trade_date"], how="left")
+    panel["year"] = panel["trade_date"].dt.year.astype(str)
+    panel["market_regime"] = panel["trade_date"].map(regime_by_date).fillna("unknown")
+
     summary = _ic_summary(panel, horizons)
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
+    by_year = _ic_summary_by(panel, horizons, "year")
+    by_year.to_csv(storage.result_path / "factor_ic_by_year.csv", index=False, encoding="utf-8-sig")
+    by_regime = _ic_summary_by(panel, horizons, "market_regime")
+    by_regime.to_csv(storage.result_path / "factor_ic_by_regime.csv", index=False, encoding="utf-8-sig")
     # Spearman == Pearson on ranks; ranking first keeps this scipy-free. Constant
     # factors (e.g. all-neutral market_cap) divide by zero variance -> NaN; mute
     # the expected numpy warning so it does not spam the multi-hour run.
     with np.errstate(invalid="ignore", divide="ignore"):
         corr = scored_all[FACTOR_SCORE_COLUMNS].rank().corr()
-    _write_markdown(markdown_path, summary, corr, args.start, args.end, horizons)
+    _write_markdown(markdown_path, summary, corr, args.start, args.end, horizons, by_year=by_year, by_regime=by_regime)
     print(summary_path)
 
 
@@ -191,42 +208,57 @@ def _forward_returns(daily_bars: pd.DataFrame, horizons: list[int]) -> pd.DataFr
     return bars[columns]
 
 
+def _daily_ic(frame: pd.DataFrame, factor: str, target: str) -> pd.Series:
+    """Per-day rank IC = Pearson on per-day ranks (scipy-free Spearman)."""
+
+    return (
+        frame[["trade_date", factor, target]]
+        .dropna()
+        .groupby("trade_date")
+        .apply(lambda df: df[factor].rank().corr(df[target].rank()), include_groups=False)
+        .dropna()
+    )
+
+
+def _ic_stats(daily_ic: pd.Series) -> dict:
+    """Summarize a per-day IC series into mean/IR/t/positive-share/observations."""
+
+    observations = int(daily_ic.count())
+    mean = float(daily_ic.mean()) if observations else float("nan")
+    std = float(daily_ic.std(ddof=1)) if observations > 1 else float("nan")
+    return {
+        "ic_mean": round(mean, 6) if pd.notna(mean) else pd.NA,
+        "ic_ir": round(mean / std, 6) if pd.notna(std) and std != 0 else pd.NA,
+        "ic_t": round(mean / (std / (observations**0.5)), 6) if pd.notna(std) and std != 0 and observations > 1 else pd.NA,
+        "positive_share": round(float((daily_ic > 0).mean()), 6) if observations else pd.NA,
+        "observations": observations,
+    }
+
+
 def _ic_summary(panel: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
-    rows = []
     # Constant factors on a day have zero rank variance -> NaN IC; mute the
     # expected numpy divide warning rather than spam it once per factor per day.
     with np.errstate(invalid="ignore", divide="ignore"):
-        return _ic_summary_rows(panel, horizons, rows)
+        rows = [
+            {"factor": factor, "horizon": horizon, **_ic_stats(_daily_ic(panel, factor, f"forward_return_{horizon}d"))}
+            for horizon in horizons
+            for factor in FACTOR_SCORE_COLUMNS
+        ]
+    return pd.DataFrame(rows)
 
 
-def _ic_summary_rows(panel: pd.DataFrame, horizons: list[int], rows: list) -> pd.DataFrame:
-    for horizon in horizons:
-        target = f"forward_return_{horizon}d"
-        for factor in FACTOR_SCORE_COLUMNS:
-            daily_ic = (
-                panel[["trade_date", factor, target]]
-                .dropna()
-                .groupby("trade_date")
-                # Rank IC == Pearson on per-day ranks; avoids the scipy dependency.
-                .apply(lambda df: df[factor].rank().corr(df[target].rank()), include_groups=False)
-                .dropna()
-            )
-            observations = int(daily_ic.count())
-            mean = float(daily_ic.mean()) if observations else float("nan")
-            std = float(daily_ic.std(ddof=1)) if observations > 1 else float("nan")
-            rows.append(
-                {
-                    "factor": factor,
-                    "horizon": horizon,
-                    "ic_mean": round(mean, 6) if pd.notna(mean) else pd.NA,
-                    "ic_ir": round(mean / std, 6) if pd.notna(std) and std != 0 else pd.NA,
-                    "ic_t": round(mean / (std / (observations**0.5)), 6)
-                    if pd.notna(std) and std != 0 and observations > 1
-                    else pd.NA,
-                    "positive_share": round(float((daily_ic > 0).mean()), 6) if observations else pd.NA,
-                    "observations": observations,
-                }
-            )
+def _ic_summary_by(panel: pd.DataFrame, horizons: list[int], segment_col: str) -> pd.DataFrame:
+    """IC summary split into segments (e.g. calendar year or market regime)."""
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rows = []
+        for segment, group in panel.groupby(segment_col):
+            for horizon in horizons:
+                target = f"forward_return_{horizon}d"
+                for factor in FACTOR_SCORE_COLUMNS:
+                    rows.append(
+                        {"segment": str(segment), "factor": factor, "horizon": horizon, **_ic_stats(_daily_ic(group, factor, target))}
+                    )
     return pd.DataFrame(rows)
 
 
@@ -255,6 +287,9 @@ def _write_markdown(
     start: str,
     end: str,
     horizons: list[int],
+    *,
+    by_year: pd.DataFrame | None = None,
+    by_regime: pd.DataFrame | None = None,
 ) -> None:
     corr_table = (
         _df_to_markdown(corr.round(4).rename_axis("factor").reset_index()) if not corr.empty else "No correlation matrix."
@@ -266,10 +301,30 @@ def _write_markdown(
         f"- Horizons: {', '.join(str(horizon) for horizon in horizons)} trading days",
         "- Scope: research-only; forward returns are used only for post-hoc IC validation.",
         "",
-        "## IC Summary",
+        "## IC Summary (full window)",
         "",
         _df_to_markdown(summary) if not summary.empty else "No IC rows.",
         "",
+    ]
+    if by_year is not None and not by_year.empty:
+        lines += [
+            "## IC by Calendar Year",
+            "",
+            "Tells whether momentum is regime-dependent (positive in trending years) or broken throughout.",
+            "",
+            _df_to_markdown(by_year),
+            "",
+        ]
+    if by_regime is not None and not by_regime.empty:
+        lines += [
+            "## IC by Market Regime",
+            "",
+            "Regime is the daily sentiment state (history-only). Watch whether momentum flips sign by regime.",
+            "",
+            _df_to_markdown(by_regime),
+            "",
+        ]
+    lines += [
         "## Factor Score Spearman Correlation",
         "",
         corr_table,
