@@ -5,6 +5,7 @@ from scripts.analyze_factor_ic import (
     _df_to_markdown,
     _ic_summary,
     _ic_summary_by,
+    _research_momentum,
     _write_markdown,
     build_arg_parser,
 )
@@ -18,6 +19,35 @@ def test_analyze_factor_ic_accepts_space_separated_horizons():
     )
 
     assert args.horizons == [1, 3, 5, 10]
+
+
+def test_default_horizons_cover_long_holding_periods():
+    args = build_arg_parser().parse_args(["--start", "2022-01-01", "--end", "2026-06-12"])
+
+    assert args.horizons == [1, 3, 5, 10, 20, 60]
+    assert args.reuse_scored is False
+
+
+def test_research_momentum_skips_recent_days_and_uses_full_lookback():
+    # One stock, ascending close. lookback=3, skip=1 at the last row uses
+    # close[t-1]/close[t-4]-1, i.e. it ignores the most recent day's move.
+    bars = pd.DataFrame(
+        {
+            "stock_code": ["600001.SH"] * 6,
+            "trade_date": pd.to_datetime(
+                ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-08", "2024-01-09"]
+            ),
+            "close": [10.0, 11.0, 12.0, 13.0, 14.0, 100.0],
+        }
+    )
+
+    out = _research_momentum(bars, [("mom_3_skip1", 3, 1)])
+    last = out.iloc[-1]
+
+    # skip the 14->100 jump: close[t-1]=14 over close[t-4]=11 -> 14/11 - 1.
+    assert last["mom_3_skip1"] == 14.0 / 11.0 - 1
+    # Warmup rows without skip+lookback history are NaN (dropped by the IC step).
+    assert out["mom_3_skip1"].isna().sum() == 4
 
 
 def _ic_panel(factor_values: list[float], forward_values: list[float]) -> pd.DataFrame:

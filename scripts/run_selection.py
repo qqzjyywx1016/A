@@ -148,7 +148,18 @@ def run_selection(
             index_bars=index_bars,
         ),
     }
-    scored = ScoreEngine(config.get("score_weights", {})).score(factors, stock_basic)
+    # Resolve the day's market regime from the sentiment factor up front so it can
+    # both gate the composite weights and size positions (one source of truth).
+    sentiment_df = factors.get("sentiment")
+    market_regime = "neutral"
+    if isinstance(sentiment_df, pd.DataFrame) and not sentiment_df.empty and "market_regime" in sentiment_df.columns:
+        regimes = sentiment_df["market_regime"].dropna()
+        if not regimes.empty:
+            market_regime = str(regimes.mode().iloc[0])
+    scored = ScoreEngine(
+        config.get("score_weights", {}),
+        config.get("regime_weight_multipliers", {}),
+    ).score(factors, stock_basic, market_regime=market_regime)
     if allowed_codes:
         scored = scored[scored["stock_code"].isin(allowed_codes)].copy()
     else:
@@ -162,9 +173,6 @@ def run_selection(
     # Rating-based sizing runs before selection so the selector's sector-exposure
     # cap sees real suggested_position values and the backtest can honor them.
     if not scored.empty and "rating" in scored.columns:
-        market_regime = "neutral"
-        if "market_regime" in scored.columns and not scored["market_regime"].dropna().empty:
-            market_regime = str(scored["market_regime"].dropna().mode().iloc[0])
         scored = PositionSizer(config.get("position", {})).suggest(scored, market_regime=market_regime)
     selected = StockSelector(selection_config(config)).select(scored, trade_date=trade_date)["watch_pool"]
     plan_fields = [column for column in ["stock_code", "close", "high", "ma5", "ma10"] if column in latest.columns]

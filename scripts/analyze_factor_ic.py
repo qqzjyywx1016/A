@@ -42,6 +42,20 @@ FACTOR_SCORE_COLUMNS = [
     "total_score",
 ]
 
+# Research-only long-horizon momentum variants. The production momentum_score is
+# 5-20d RPS, which is NEGATIVE at 1-10d (short-term reversal). These test whether a
+# genuine medium-term, skip-the-most-recent-days momentum (the academic "12-1"
+# construction) earns positive IC at longer forward horizons -- the question that
+# decides momentum's fate. (name, lookback_days, skip_days): return from
+# t-(skip+lookback) to t-skip, ranked cross-sectionally each day.
+RESEARCH_MOMENTUM_SPECS = [
+    ("momentum_120_skip5", 120, 5),
+    ("momentum_60_skip5", 60, 5),
+    ("momentum_20_skip0", 20, 0),
+]
+RESEARCH_FACTOR_COLUMNS = [name for name, _, _ in RESEARCH_MOMENTUM_SPECS]
+ALL_FACTOR_COLUMNS = FACTOR_SCORE_COLUMNS + RESEARCH_FACTOR_COLUMNS
+
 
 def parse_horizons(values: list[int] | str) -> list[int]:
     if isinstance(values, list):
@@ -53,7 +67,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
-    parser.add_argument("--horizons", nargs="+", type=int, default=[1, 3, 5, 10])
+    parser.add_argument("--horizons", nargs="+", type=int, default=[1, 3, 5, 10, 20, 60])
+    parser.add_argument(
+        "--reuse-scored",
+        action="store_true",
+        help="Skip the multi-hour scoring loop and reuse a cached factor_scores_panel.parquet "
+        "from a prior run (only recomputes forward returns / research factors / IC). "
+        "Use after a full run to iterate on horizons quickly.",
+    )
     return parser
 
 
@@ -81,7 +102,9 @@ def main() -> None:
     storage = StorageManager(config)
     adapter = AStockDataAdapter(config, storage=storage)
     horizons = parse_horizons(args.horizons)
-    load_start = (pd.Timestamp(args.start) - timedelta(days=180)).date().isoformat()
+    # 280 calendar days (~190 trading days) of padding so the longest research
+    # momentum lookback (120d + 5d skip) is warm from the first scored date.
+    load_start = (pd.Timestamp(args.start) - timedelta(days=280)).date().isoformat()
 
     stock_basic = adapter.get_stock_basic()
     daily_bars = adapter.get_daily_bars(load_start, args.end)
@@ -105,62 +128,81 @@ def main() -> None:
 
     daily_bars = enrich_daily_bars_for_selection(daily_bars)
     daily_bars["trade_date"] = pd.to_datetime(daily_bars["trade_date"]).dt.normalize()
-    scored_frames = []
-    dates = sorted(
-        date
-        for date in daily_bars["trade_date"].drop_duplicates()
-        if pd.Timestamp(args.start).normalize() <= date <= pd.Timestamp(args.end).normalize()
-    )
-    total_dates = len(dates)
-    regime_by_date: dict[pd.Timestamp, str] = {}
-    print(f"scoring {total_dates} trading days from {args.start} to {args.end} (this can take a while)...", flush=True)
-    for index, trade_date in enumerate(dates, start=1):
-        trade_date_str = pd.Timestamp(trade_date).date().isoformat()
-        bars_slice = daily_bars[daily_bars["trade_date"] <= trade_date].copy()
-        latest = bars_slice[bars_slice["trade_date"] == trade_date].copy()
-        if index % 20 == 0 or index == total_dates:
-            print(f"[{index}/{total_dates}] scored through {trade_date_str}", flush=True)
-        if latest.empty:
-            continue
-        if not stock_basic.empty:
-            latest = latest.merge(stock_basic, on="stock_code", how="left", suffixes=("", "_basic"))
-        sector_slice = _slice_by_date(sector_daily, trade_date)
-        index_slice = _slice_by_date(index_bars, trade_date)
-        # Per-date market regime (history-only, no lookahead) so IC can be split
-        # by regime -- the key question is whether momentum only works in某些 regimes.
-        sentiment = SentimentFactor(config.get("sentiment", {})).calculate(
-            bars_slice, trade_date=trade_date_str, index_bars=index_slice
+
+    # The scoring loop is the ~4h cost; cache its output so re-runs that only change
+    # horizons / research factors are fast. The cache carries the per-day regime.
+    panel_path = storage.result_path / "factor_scores_panel.parquet"
+    if args.reuse_scored and panel_path.exists():
+        scored_all = pd.read_parquet(panel_path)
+        scored_all["trade_date"] = pd.to_datetime(scored_all["trade_date"]).dt.normalize()
+        print(f"reusing cached scored panel ({len(scored_all)} rows) from {panel_path}", flush=True)
+    else:
+        scored_frames = []
+        dates = sorted(
+            date
+            for date in daily_bars["trade_date"].drop_duplicates()
+            if pd.Timestamp(args.start).normalize() <= date <= pd.Timestamp(args.end).normalize()
         )
-        regime_by_date[trade_date] = (
-            str(sentiment["market_regime"].iloc[0]) if not sentiment.empty and "market_regime" in sentiment.columns else "unknown"
-        )
-        sector_factor = SectorFactor(sector_factor_config(config)).calculate(
-            bars_slice,
-            trade_date=trade_date_str,
-            sector_map=sector_map,
-            sector_daily=sector_slice,
-        )
-        factors = {
-            "momentum": MomentumFactor().calculate(
+        total_dates = len(dates)
+        regime_by_date: dict[pd.Timestamp, str] = {}
+        print(f"scoring {total_dates} trading days from {args.start} to {args.end} (this can take a while)...", flush=True)
+        for index, trade_date in enumerate(dates, start=1):
+            trade_date_str = pd.Timestamp(trade_date).date().isoformat()
+            bars_slice = daily_bars[daily_bars["trade_date"] <= trade_date].copy()
+            latest = bars_slice[bars_slice["trade_date"] == trade_date].copy()
+            if index % 20 == 0 or index == total_dates:
+                print(f"[{index}/{total_dates}] scored through {trade_date_str}", flush=True)
+            if latest.empty:
+                continue
+            if not stock_basic.empty:
+                latest = latest.merge(stock_basic, on="stock_code", how="left", suffixes=("", "_basic"))
+            sector_slice = _slice_by_date(sector_daily, trade_date)
+            index_slice = _slice_by_date(index_bars, trade_date)
+            # Per-date market regime (history-only, no lookahead) so IC can be split
+            # by regime -- the key question is whether momentum only works in某些 regimes.
+            sentiment = SentimentFactor(config.get("sentiment", {})).calculate(
+                bars_slice, trade_date=trade_date_str, index_bars=index_slice
+            )
+            regime = (
+                str(sentiment["market_regime"].iloc[0]) if not sentiment.empty and "market_regime" in sentiment.columns else "unknown"
+            )
+            regime_by_date[trade_date] = regime
+            sector_factor = SectorFactor(sector_factor_config(config)).calculate(
                 bars_slice,
                 trade_date=trade_date_str,
-                index_bars=index_slice,
-                sector_daily=sector_slice,
                 sector_map=sector_map,
-            ),
-            "volume": VolumeFactor().calculate(bars_slice, trade_date=trade_date_str),
-            "sector": sector_factor,
-            "market_cap": MarketCapFactor().calculate(
-                build_market_cap_snapshot(latest, sector_factor),
-                trade_date=trade_date_str,
-            ),
-            "reversal": ReversalFactor().calculate(bars_slice, trade_date=trade_date_str),
-        }
-        scored = ScoreEngine(config.get("score_weights", {})).score(factors, stock_basic)
-        if not scored.empty:
-            scored_frames.append(scored[["stock_code", "trade_date", *FACTOR_SCORE_COLUMNS]].copy())
+                sector_daily=sector_slice,
+            )
+            factors = {
+                "momentum": MomentumFactor().calculate(
+                    bars_slice,
+                    trade_date=trade_date_str,
+                    index_bars=index_slice,
+                    sector_daily=sector_slice,
+                    sector_map=sector_map,
+                ),
+                "volume": VolumeFactor().calculate(bars_slice, trade_date=trade_date_str),
+                "sector": sector_factor,
+                "market_cap": MarketCapFactor().calculate(
+                    build_market_cap_snapshot(latest, sector_factor),
+                    trade_date=trade_date_str,
+                ),
+                "reversal": ReversalFactor().calculate(bars_slice, trade_date=trade_date_str),
+            }
+            # Score with the production weights AND regime gating so total_score IC
+            # reflects what live selection actually ships, not the raw blend.
+            scored = ScoreEngine(
+                config.get("score_weights", {}), config.get("regime_weight_multipliers", {})
+            ).score(factors, stock_basic, market_regime=regime)
+            if not scored.empty:
+                scored_frames.append(scored[["stock_code", "trade_date", *FACTOR_SCORE_COLUMNS]].copy())
 
-    scored_all = pd.concat(scored_frames, ignore_index=True) if scored_frames else pd.DataFrame()
+        scored_all = pd.concat(scored_frames, ignore_index=True) if scored_frames else pd.DataFrame()
+        if not scored_all.empty:
+            scored_all["trade_date"] = pd.to_datetime(scored_all["trade_date"]).dt.normalize()
+            scored_all["market_regime"] = scored_all["trade_date"].map(regime_by_date).fillna("unknown")
+            scored_all.to_parquet(panel_path, index=False)
+
     if scored_all.empty:
         empty_summary = pd.DataFrame(
             columns=["factor", "horizon", "ic_mean", "ic_ir", "ic_t", "positive_share", "observations"]
@@ -170,11 +212,16 @@ def main() -> None:
         print(summary_path)
         return
 
-    scored_all["trade_date"] = pd.to_datetime(scored_all["trade_date"]).dt.normalize()
+    if "market_regime" not in scored_all.columns:
+        scored_all["market_regime"] = "unknown"
+    # Research long-horizon momentum is cheap (just daily_bars), so recompute it
+    # every run -- this is where the specs get tuned without paying the scoring cost.
+    research = _research_momentum(daily_bars, RESEARCH_MOMENTUM_SPECS)
+    scored_all = scored_all.merge(research, on=["stock_code", "trade_date"], how="left")
+
     forward = _forward_returns(daily_bars, horizons)
     panel = scored_all.merge(forward, on=["stock_code", "trade_date"], how="left")
     panel["year"] = panel["trade_date"].dt.year.astype(str)
-    panel["market_regime"] = panel["trade_date"].map(regime_by_date).fillna("unknown")
 
     summary = _ic_summary(panel, horizons)
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
@@ -186,7 +233,7 @@ def main() -> None:
     # factors (e.g. all-neutral market_cap) divide by zero variance -> NaN; mute
     # the expected numpy warning so it does not spam the multi-hour run.
     with np.errstate(invalid="ignore", divide="ignore"):
-        corr = scored_all[FACTOR_SCORE_COLUMNS].rank().corr()
+        corr = panel[ALL_FACTOR_COLUMNS].rank().corr()
     _write_markdown(markdown_path, summary, corr, args.start, args.end, horizons, by_year=by_year, by_regime=by_regime)
     print(summary_path)
 
@@ -197,6 +244,22 @@ def _slice_by_date(frame: pd.DataFrame, trade_date: pd.Timestamp) -> pd.DataFram
     result = frame.copy()
     result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.normalize()
     return result[result["trade_date"] <= trade_date].copy()
+
+
+def _research_momentum(daily_bars: pd.DataFrame, specs: list[tuple[str, int, int]]) -> pd.DataFrame:
+    """Per (stock, date) long-horizon momentum: return from t-(skip+lookback) to t-skip.
+
+    Skipping the most recent ``skip`` days avoids contaminating medium-term momentum
+    with the short-term reversal that dominates the 1-10d window. Returned raw; the
+    per-day IC ranks it, so no 0-100 rescale is needed.
+    """
+
+    bars = daily_bars.sort_values(["stock_code", "trade_date"]).copy()
+    close = bars.groupby("stock_code", group_keys=False)["close"]
+    out = bars[["stock_code", "trade_date"]].copy()
+    for name, lookback, skip in specs:
+        out[name] = close.shift(skip) / close.shift(skip + lookback) - 1
+    return out
 
 
 def _forward_returns(daily_bars: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
@@ -239,10 +302,11 @@ def _ic_summary(panel: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
     # Constant factors on a day have zero rank variance -> NaN IC; mute the
     # expected numpy divide warning rather than spam it once per factor per day.
     with np.errstate(invalid="ignore", divide="ignore"):
+        factors = [column for column in ALL_FACTOR_COLUMNS if column in panel.columns]
         rows = [
             {"factor": factor, "horizon": horizon, **_ic_stats(_daily_ic(panel, factor, f"forward_return_{horizon}d"))}
             for horizon in horizons
-            for factor in FACTOR_SCORE_COLUMNS
+            for factor in factors
         ]
     return pd.DataFrame(rows)
 
@@ -252,10 +316,11 @@ def _ic_summary_by(panel: pd.DataFrame, horizons: list[int], segment_col: str) -
 
     with np.errstate(invalid="ignore", divide="ignore"):
         rows = []
+        factors = [column for column in ALL_FACTOR_COLUMNS if column in panel.columns]
         for segment, group in panel.groupby(segment_col):
             for horizon in horizons:
                 target = f"forward_return_{horizon}d"
-                for factor in FACTOR_SCORE_COLUMNS:
+                for factor in factors:
                     rows.append(
                         {"segment": str(segment), "factor": factor, "horizon": horizon, **_ic_stats(_daily_ic(group, factor, target))}
                     )
@@ -300,6 +365,9 @@ def _write_markdown(
         f"- Window: {start} to {end}",
         f"- Horizons: {', '.join(str(horizon) for horizon in horizons)} trading days",
         "- Scope: research-only; forward returns are used only for post-hoc IC validation.",
+        "- `momentum_<L>_skip<S>`: research-only medium-term momentum = return from "
+        "t-(S+L) to t-S (skips the most recent S days to dodge short-term reversal). "
+        "Positive IC at h20/h60 would justify keeping a momentum book.",
         "",
         "## IC Summary (full window)",
         "",

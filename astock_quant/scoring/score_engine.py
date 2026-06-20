@@ -24,8 +24,9 @@ class ScoreEngine:
         "sentiment": "sentiment_score",
     }
 
-    def __init__(self, weights: dict[str, float]):
+    def __init__(self, weights: dict[str, float], regime_multipliers: dict[str, dict[str, float]] | None = None):
         self.weights = weights
+        self.regime_multipliers = regime_multipliers or {}
 
     @staticmethod
     def _rating(total_score: float) -> str:
@@ -48,8 +49,19 @@ class ScoreEngine:
             return pd.DataFrame(columns=["stock_code", "trade_date"])
         return pd.concat(frames, ignore_index=True).drop_duplicates(["stock_code", "trade_date"])
 
-    def score(self, factors: dict[str, pd.DataFrame], stock_basic: pd.DataFrame | None = None) -> pd.DataFrame:
-        """Return composite scores with required output fields and useful selection flags."""
+    def score(
+        self,
+        factors: dict[str, pd.DataFrame],
+        stock_basic: pd.DataFrame | None = None,
+        market_regime: str | None = None,
+    ) -> pd.DataFrame:
+        """Return composite scores with required output fields and useful selection flags.
+
+        ``market_regime`` (the day's history-only sentiment state) selects a row of
+        ``regime_multipliers`` that scales the per-factor weights, so e.g. reversal
+        can be throttled in regimes where its IC is not proven. Absent regime or
+        multipliers, weighting is unchanged.
+        """
 
         result = self._base_frame(factors)
         if result.empty:
@@ -189,10 +201,11 @@ class ScoreEngine:
                 result[column] = ""
             result[column] = result[column].fillna("")
 
+        regime_mult = self.regime_multipliers.get(str(market_regime), {}) if market_regime is not None else {}
         weighted_score = pd.Series(0.0, index=result.index)
         active_weight_sum = 0.0
         for factor_name, score_column in self.FACTOR_COLUMNS.items():
-            weight = float(self.weights.get(factor_name, 0))
+            weight = float(self.weights.get(factor_name, 0)) * float(regime_mult.get(factor_name, 1.0))
             if weight <= 0 or factor_name in inactive_factors:
                 continue
             weighted_score += result[score_column] * weight

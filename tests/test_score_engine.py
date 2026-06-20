@@ -49,6 +49,23 @@ def test_score_engine_applies_weights_and_rating_thresholds():
     assert row["rating"] == "B"
 
 
+def test_score_engine_regime_multiplier_throttles_factor_weight():
+    weights = {"momentum": 0.4, "reversal": 0.4}
+    regime_multipliers = {"strong": {"reversal": 0.5}}
+    factors = {
+        "momentum": pd.DataFrame([{"stock_code": "600001.SH", "trade_date": "2026-06-04", "score": 80}]),
+        "reversal": pd.DataFrame([{"stock_code": "600001.SH", "trade_date": "2026-06-04", "score": 40}]),
+    }
+    engine = ScoreEngine(weights, regime_multipliers)
+
+    # neutral has no multiplier -> identity: (80*0.4 + 40*0.4) / 0.8 = 60.
+    assert engine.score(factors, market_regime="neutral").iloc[0]["total_score"] == 60.0
+    # market_regime=None -> identity (back-compat with existing callers).
+    assert engine.score(factors).iloc[0]["total_score"] == 60.0
+    # strong halves reversal's weight: (80*0.4 + 40*0.2) / 0.6 = 66.67.
+    assert engine.score(factors, market_regime="strong").iloc[0]["total_score"] == 66.67
+
+
 def test_score_engine_fills_missing_fund_flow_with_neutral_score():
     weights = {
         "momentum": 0.25,

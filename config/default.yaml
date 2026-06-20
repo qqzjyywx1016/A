@@ -35,15 +35,29 @@ universe:
   max_float_market_cap:
 
 score_weights:
-  # Provisional, pending IC validation. baostock 阶段 market_cap 因无 circ_mv 暂停用。
-  momentum: 0.25
-  volume: 0.20
-  sector: 0.15
+  # Reweighted from 4.5y rank-IC (2022-01..2026-06, scripts/analyze_factor_ic.py).
+  # reversal: only robustly POSITIVE factor every year & regime (t>4.5) -> primary.
+  # momentum: 5-20d RPS, NEGATIVE IC every year & every regime at 1-10d horizon.
+  #   Kept small pending the forward-h20/h60 long-horizon test (see analyze_factor_ic
+  #   research factors); do NOT raise until that confirms medium-term momentum pays.
+  # volume: ~0 IC across 4.5y/all regimes -> cut. sector: consistently mildly NEG.
+  # market_cap: dead (no circ_mv on baostock).
+  momentum: 0.10
+  volume: 0.0
+  sector: 0.05
   market_cap: 0.0
-  reversal: 0.15
+  reversal: 0.40
   fund_flow: 0.0
   pattern: 0.0
   sentiment: 0.0
+
+# Regime-conditional weight multipliers (applied on top of score_weights per the
+# day's market_regime). IC shows reversal's edge concentrates in weak/neutral
+# (t=6.9 / 2.2); it is flat in strong (t~0.1) and only weakly positive in risk_off
+# (t~0.9), so we throttle it where it is not proven. Absent regime -> identity.
+regime_weight_multipliers:
+  strong: {reversal: 0.3}
+  risk_off: {reversal: 0.5}
 
 selection:
   min_total_score: 70
